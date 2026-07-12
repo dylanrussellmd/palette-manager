@@ -1,21 +1,18 @@
 # palette-manager
 
-TUI for managing color palettes for [niri](https://github.com/niri-wm/niri) + [Quickshell](https://quickshell.outfoxxed.me/) theming via [chezmoi](https://chezmoi.io/) data files.
+TUI for managing color palettes with configurable apply behavior.
 
 ## How it works
 
 ```
 palettes.yaml  ──palette-manager──►  active palette
                                           │
-                                     writes colors to
+                                     writes colors to (optional)
                                           │
-                                     theme.yaml  ──chezmoi apply──►  config.kdl + Theme.qml
-                                          │                                │
-                                          ▼                                ▼
-                                        niri                          Quickshell
+                                     theme_file  ──runs──►  apply_command
 ```
 
-Both niri and Quickshell read from the same chezmoi data (`theme.yaml`), so colors stay unified across the compositor and shell components.
+Palette-manager is generic — it stores palettes in a YAML file and optionally writes the active palette's colors to a separate file, then runs a shell command. The specific integration (chezmoi, hyprland, custom script) is defined in a config file.
 
 ## Install
 
@@ -23,12 +20,87 @@ Both niri and Quickshell read from the same chezmoi data (`theme.yaml`), so colo
 uv tool install git+ssh://git@github.com/dylanrussellmd/palette-manager
 ```
 
+## Quick start
+
+```bash
+palette-manager --init    # create default config at ~/.config/palette-manager/config.yaml
+palette-manager           # launch the TUI
+```
+
+Without any config, palette-manager stores palettes in `~/.config/palette-manager/palettes.yaml` and does nothing on apply (just marks the palette as active).
+
+## Configuration
+
+Edit `~/.config/palette-manager/config.yaml`:
+
+```yaml
+# Where to store palettes
+palettes_file: ~/.config/palette-manager/palettes.yaml
+
+# Where to write the active palette's colors on apply.
+# Set to null to skip writing.
+theme_file: null
+
+# Dotted path within the theme file to write colors under.
+# e.g. "theme.colors" writes to doc["theme"]["colors"]
+# Leave null to write at the root level.
+theme_path: null
+
+# Color keys to write to the theme file.
+theme_keys: [bg, surface, text, accent, urgent, border, shadow]
+
+# Shell command to run after writing colors on apply.
+# Set to null to skip.
+apply_command: null
+```
+
+### Example: chezmoi + niri + Quickshell
+
+```yaml
+palettes_file: ~/.local/share/chezmoi/.chezmoidata/palettes.yaml
+theme_file: ~/.local/share/chezmoi/.chezmoidata/theme.yaml
+theme_path: theme.colors
+theme_keys: [bg, surface, text, accent, urgent, border, shadow]
+apply_command: chezmoi apply
+```
+
+### Example: Hyprland
+
+```yaml
+palettes_file: ~/.config/palette-manager/palettes.yaml
+theme_file: ~/.config/hypr/colors.conf
+theme_path: null
+theme_keys: [bg, surface, text, accent, urgent, border, shadow]
+apply_command: hyprctl reload
+```
+
+### Example: custom script
+
+```yaml
+palettes_file: ~/.config/palette-manager/palettes.yaml
+theme_file: ~/.config/palette-manager/colors.yaml
+theme_path: null
+theme_keys: [bg, surface, text, accent, urgent, border, shadow]
+apply_command: ~/.config/palette-manager/apply.sh
+```
+
+### Example: standalone (no apply)
+
+```yaml
+palettes_file: ~/.config/palette-manager/palettes.yaml
+theme_file: null
+theme_path: null
+apply_command: null
+```
+
 ## Usage
 
 ```bash
 palette-manager              # launch the TUI
 palette-manager --check      # list palettes from CLI
-palette-manager --apply      # apply active palette + chezmoi apply (non-interactive)
+palette-manager --apply      # apply active palette (non-interactive)
+palette-manager --init       # create default config file
+palette-manager --config /path/to/config.yaml   # use a specific config
 ```
 
 ### List screen
@@ -39,7 +111,7 @@ palette-manager --apply      # apply active palette + chezmoi apply (non-interac
 | `e` or `Enter` | Edit selected palette |
 | `n` | New palette |
 | `d` | Delete palette |
-| `a` | Activate + apply (writes theme.yaml, runs chezmoi apply) |
+| `a` | Activate + apply |
 | `q` | Quit |
 
 ### Edit screen
@@ -50,16 +122,6 @@ palette-manager --apply      # apply active palette + chezmoi apply (non-interac
 - `Ctrl+S` or Save button to save
 - `Esc` or Cancel button to discard
 
-## Configuration
-
-Paths default to chezmoi's data directory but can be overridden:
-
-| Env var | Default |
-|---|---|
-| `CHEZMOI_DIR` | `~/.local/share/chezmoi` |
-| `PALETTES_FILE` | `$CHEZMOI_DIR/.chezmoidata/palettes.yaml` |
-| `THEME_FILE` | `$CHEZMOI_DIR/.chezmoidata/theme.yaml` |
-
 ## Seeded palettes
 
 Default, Catppuccin Mocha, Tokyo Night, Gruvbox Dark, Nord, Rose Pine.
@@ -67,5 +129,4 @@ Default, Catppuccin Mocha, Tokyo Night, Gruvbox Dark, Nord, Rose Pine.
 ## Requirements
 
 - Python ≥ 3.11
-- chezmoi (for apply action)
 - A terminal with true-color support

@@ -1,18 +1,25 @@
-"""TUI for managing color palettes for niri + Quickshell theming.
+"""TUI for managing color palettes with configurable apply behavior.
 
-Palettes are stored in chezmoi data (palettes.yaml). The active
-palette's colors are written to theme.yaml, then `chezmoi apply`
-renders both niri config.kdl and Quickshell Theme.qml.
+By default, palettes are stored in ~/.config/palette-manager/palettes.yaml.
+Configure theme file output and apply commands via a config file:
 
-Paths are configurable via environment variables:
-    CHEZMOI_DIR    Path to chezmoi source (default: ~/.local/share/chezmoi)
-    PALETTES_FILE  Override path to palettes.yaml
-    THEME_FILE     Override path to theme.yaml
+    palette-manager --init          Create default config at
+                                    ~/.config/palette-manager/config.yaml
+
+Config file format (YAML):
+
+    palettes_file: ~/.config/palette-manager/palettes.yaml
+    theme_file: null               # where to write active palette's colors
+    theme_path: null               # dotted path within the file (e.g. "theme.colors")
+    theme_keys: [bg, surface, text, accent, urgent, border, shadow]
+    apply_command: null            # shell command to run after writing
 
 Usage:
-    palette-manager              Launch the palette manager
+    palette-manager              Launch the TUI
     palette-manager --check      List palettes and exit
-    palette-manager --apply      Apply active palette + chezmoi apply (non-interactive)
+    palette-manager --apply      Apply active palette (non-interactive)
+    palette-manager --init       Create default config file
+    palette-manager --config /path/to/config.yaml   Use a specific config
 
 List screen:
     ↑/↓      Navigate palettes
@@ -30,9 +37,10 @@ Edit screen:
 
 from __future__ import annotations
 
-import os
+import argparse
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ruamel.yaml import YAML
@@ -45,13 +53,7 @@ from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import Button, Footer, Header, Input, Label, Static
 
-# ── Configurable paths ────────────────────────────────────────────
-
-CHEZMOI_DIR = Path(os.environ.get("CHEZMOI_DIR", Path.home() / ".local/share/chezmoi"))
-PALETTES_FILE = Path(
-    os.environ.get("PALETTES_FILE", CHEZMOI_DIR / ".chezmoidata/palettes.yaml")
-)
-THEME_FILE = Path(os.environ.get("THEME_FILE", CHEZMOI_DIR / ".chezmoidata/theme.yaml"))
+# ── Constants ────────────────────────────────────────────────────
 
 COLOR_KEYS = ["bg", "surface", "text", "accent", "urgent", "border", "shadow"]
 
@@ -112,19 +114,113 @@ SEED_PALETTES = {
     },
 }
 
+CONFIG_DIR = Path.home() / ".config" / "palette-manager"
+DEFAULT_CONFIG_FILE = CONFIG_DIR / "config.yaml"
+DEFAULT_PALETTES_FILE = CONFIG_DIR / "palettes.yaml"
+
+
+# ── Config ────────────────────────────────────────────────────────
+
+
+@dataclass
+class Config:
+    """Runtime configuration loaded from config.yaml."""
+
+    palettes_file: Path = DEFAULT_PALETTES_FILE
+    theme_file: Path | None = None
+    theme_path: str | None = None
+    theme_keys: list[str] = field(default_factory=lambda: list(COLOR_KEYS))
+    apply_command: str | None = None
+
+
+def load_config(config_path: Path | None = None) -> Config:
+    """Load config from YAML file, falling back to defaults."""
+    path = config_path or DEFAULT_CONFIG_FILE
+    if not path.exists():
+        return Config()
+
+    yaml = YAML()
+    with open(path) as f:
+        data = yaml.load(f)
+
+    if data is None:
+        return Config()
+
+    def resolve(p: str | None) -> Path | None:
+        if p is None:
+            return None
+        return Path(p).expanduser()
+
+    return Config(
+        palettes_file=resolve(data.get("palettes_file")) or DEFAULT_PALETTES_FILE,
+        theme_file=resolve(data.get("theme_file")),
+        theme_path=data.get("theme_path"),
+        theme_keys=data.get("theme_keys") or list(COLOR_KEYS),
+        apply_command=data.get("apply_command"),
+    )
+
+
+def init_config(config_path: Path | None = None) -> int:
+    """Create a default config file with comments."""
+    path = config_path or DEFAULT_CONFIG_FILE
+    if path.exists():
+        print(f"Config already exists: {path}", file=sys.stderr)
+        return 1
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    default_config = """\
+# Palette Manager configuration
+# https://github.com/dylanrussellmd/palette-manager
+
+# Where to store palettes (created automatically if missing)
+palettes_file: ~/.config/palette-manager/palettes.yaml
+
+# Where to write the active palette's colors on apply.
+# Set to null to skip writing (palettes are still saved).
+theme_file: null
+
+# Dotted path within the theme file to write colors under.
+# e.g. "theme.colors" writes to doc["theme"]["colors"]
+# Leave null to write at the root level.
+theme_path: null
+
+# Color keys to write to the theme file.
+theme_keys:
+  - bg
+  - surface
+  - text
+  - accent
+  - urgent
+  - border
+  - shadow
+
+# Shell command to run after writing colors on apply.
+# Examples:
+#   apply_command: chezmoi apply
+#   apply_command: hyprctl reload
+#   apply_command: ~/.config/palette-manager/apply.sh
+apply_command: null
+"""
+    path.write_text(default_config)
+    print(f"Created config: {path}")
+    print("Edit it to configure theme_file and apply_command for your setup.")
+    return 0
+
 
 # ── YAML helpers ──────────────────────────────────────────────────
 
 
-def load_palettes() -> tuple[dict, str]:
+def load_palettes(config: Config) -> tuple[dict, str]:
     """Load palettes.yaml. Seeds with defaults if missing."""
     yaml = YAML()
-    if not PALETTES_FILE.exists():
+    if not config.palettes_file.exists():
+        config.palettes_file.parent.mkdir(parents=True, exist_ok=True)
         data = {"active": "Default", "palettes": SEED_PALETTES}
-        _dump_yaml(PALETTES_FILE, data)
+        _dump_yaml(config.palettes_file, data)
         return dict(SEED_PALETTES), "Default"
 
-    with open(PALETTES_FILE) as f:
+    with open(config.palettes_file) as f:
         doc = yaml.load(f)
     palettes = dict(doc.get("palettes", {}))
     active = doc.get("active", "")
@@ -136,48 +232,67 @@ def load_palettes() -> tuple[dict, str]:
     return palettes, active
 
 
-def save_palettes(palettes: dict, active: str) -> None:
+def save_palettes(palettes: dict, active: str, config: Config) -> None:
     """Write palettes + active name to palettes.yaml."""
     data = {"active": active, "palettes": palettes}
-    _dump_yaml(PALETTES_FILE, data)
+    _dump_yaml(config.palettes_file, data)
 
 
-def write_theme_colors(colors: dict) -> None:
-    """Write active palette's colors into theme.yaml, preserving layout + comments."""
+def write_theme_colors(colors: dict, config: Config) -> None:
+    """Write active palette's colors into theme file, preserving comments."""
+    if config.theme_file is None:
+        return
+
     yaml = YAML()
-    with open(THEME_FILE) as f:
-        doc = yaml.load(f)
-    theme = doc.get("theme", doc)
-    theme_colors = theme.get("colors", {})
-    for key in COLOR_KEYS:
-        if key in theme_colors:
-            theme_colors[key] = colors[key]
-    with open(THEME_FILE, "w") as f:
+    if config.theme_file.exists():
+        with open(config.theme_file) as f:
+            doc = yaml.load(f)
+    else:
+        doc = {}
+
+    # Navigate to the target path
+    target = doc
+    if config.theme_path:
+        for part in config.theme_path.split("."):
+            if part not in target or target[part] is None:
+                target[part] = {}
+            target = target[part]
+
+    for key in config.theme_keys:
+        target[key] = colors[key]
+
+    config.theme_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(config.theme_file, "w") as f:
         yaml.dump(doc, f)
 
 
 def _dump_yaml(path: Path, data: dict) -> None:
     yaml = YAML()
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         yaml.dump(data, f)
 
 
-def run_chezmoi_apply() -> tuple[bool, str]:
-    """Run chezmoi apply. Returns (success, message)."""
+def run_apply_command(config: Config) -> tuple[bool, str]:
+    """Run the configured apply command. Returns (success, message)."""
+    if config.apply_command is None:
+        return True, ""
+
     try:
         result = subprocess.run(
-            ["chezmoi", "apply"],
+            config.apply_command,
+            shell=True,
             capture_output=True,
             text=True,
             timeout=120,
         )
         if result.returncode == 0:
-            return True, "chezmoi apply complete"
-        return False, f"chezmoi apply failed: {result.stderr[:200]}"
+            return True, f"{config.apply_command} complete"
+        return False, f"{config.apply_command} failed: {result.stderr[:200]}"
     except FileNotFoundError:
-        return False, "chezmoi not found"
+        return False, f"command not found: {config.apply_command}"
     except subprocess.TimeoutExpired:
-        return False, "chezmoi apply timed out"
+        return False, f"{config.apply_command} timed out"
 
 
 # ── Color swatch widget ──────────────────────────────────────────
@@ -425,10 +540,10 @@ class PaletteEditScreen(ModalScreen):
 
 
 class PaletteApp(App):
-    """Palette manager for unified niri + Quickshell theming."""
+    """Palette manager with configurable apply behavior."""
 
     TITLE = "Palette Manager"
-    SUB_TITLE = str(PALETTES_FILE)
+    SUB_TITLE = ""  # set in __init__
 
     CSS = """
     #palette-list {
@@ -453,9 +568,11 @@ class PaletteApp(App):
 
     selected_index = reactive(0)
 
-    def __init__(self) -> None:
+    def __init__(self, config: Config) -> None:
         super().__init__()
-        self.palettes, self.active_palette = load_palettes()
+        self.config = config
+        self.palettes, self.active_palette = load_palettes(config)
+        self.SUB_TITLE = str(config.palettes_file)
 
     # ── Compose ───────────────────────────────────────────────────
 
@@ -549,7 +666,7 @@ class PaletteApp(App):
                 if self.active_palette == name:
                     self.active_palette = new_name
             self.palettes[new_name] = new_colors
-            save_palettes(self.palettes, self.active_palette)
+            save_palettes(self.palettes, self.active_palette, self.config)
             self._refresh_cards()
             self.notify(f"Saved '{new_name}'", timeout=2)
 
@@ -572,7 +689,7 @@ class PaletteApp(App):
                 return
             new_name, new_colors = result
             self.palettes[new_name] = new_colors
-            save_palettes(self.palettes, self.active_palette)
+            save_palettes(self.palettes, self.active_palette, self.config)
             self.selected_index = list(self.palettes.keys()).index(new_name)
             self._refresh_cards()
             self.notify(f"Created '{new_name}'", timeout=2)
@@ -594,26 +711,38 @@ class PaletteApp(App):
             self.active_palette = next(iter(self.palettes))
         if self.selected_index >= len(self.palettes):
             self.selected_index = max(0, len(self.palettes) - 1)
-        save_palettes(self.palettes, self.active_palette)
+        save_palettes(self.palettes, self.active_palette, self.config)
         self._refresh_cards()
         self.notify(f"Deleted '{name}'", timeout=2)
 
     def action_activate(self) -> None:
-        """Set selected palette as active, write to theme.yaml, and run chezmoi apply."""
+        """Set selected palette as active, write colors, and run apply command."""
         name = self._selected_name()
         if name is None:
             return
         self.active_palette = name
         colors = self.palettes[name]
-        write_theme_colors(colors)
-        save_palettes(self.palettes, self.active_palette)
+
+        # Write to theme file if configured
+        if self.config.theme_file is not None:
+            write_theme_colors(colors, self.config)
+
+        save_palettes(self.palettes, self.active_palette, self.config)
         self._refresh_cards()
-        self.notify(f"Applied '{name}' — running chezmoi apply...", timeout=3)
-        ok, msg = run_chezmoi_apply()
-        if ok:
-            self.notify(msg, timeout=3)
+
+        # Run apply command if configured
+        if self.config.apply_command:
+            self.notify(
+                f"Applied '{name}' — running {self.config.apply_command}...",
+                timeout=3,
+            )
+            ok, msg = run_apply_command(self.config)
+            if ok and msg:
+                self.notify(msg, timeout=3)
+            elif not ok:
+                self.notify(msg, timeout=5, severity="error")
         else:
-            self.notify(msg, timeout=5, severity="error")
+            self.notify(f"Saved '{name}' as active", timeout=2)
 
     def action_noop(self) -> None:
         """Suppress Textual's built-in command palette (Ctrl+P)."""
@@ -623,10 +752,17 @@ class PaletteApp(App):
 # ── CLI entry points ─────────────────────────────────────────────
 
 
-def check_palettes() -> int:
-    palettes, active = load_palettes()
-    print(f"\n  {PALETTES_FILE}\n")
-    print(f"  Active: {active}\n")
+def check_palettes(config: Config) -> int:
+    palettes, active = load_palettes(config)
+    print(f"\n  Palettes: {config.palettes_file}")
+    if config.theme_file:
+        print(
+            f"  Theme:    {config.theme_file}"
+            + (f" ({config.theme_path})" if config.theme_path else "")
+        )
+    if config.apply_command:
+        print(f"  Apply:    {config.apply_command}")
+    print(f"\n  Active: {active}\n")
     for name, colors in palettes.items():
         marker = " ★" if name == active else ""
         print(f"  {name}{marker}")
@@ -636,30 +772,48 @@ def check_palettes() -> int:
     return 0
 
 
-def apply_noninteractive() -> int:
-    palettes, active = load_palettes()
+def apply_noninteractive(config: Config) -> int:
+    palettes, active = load_palettes(config)
     if not palettes or not active:
         print("No active palette found", file=sys.stderr)
         return 1
     colors = palettes[active]
-    write_theme_colors(colors)
-    save_palettes(palettes, active)
-    print(f"Applied '{active}' to theme.yaml")
-    ok, msg = run_chezmoi_apply()
-    print(f"  {msg}")
-    return 0 if ok else 1
+    if config.theme_file is not None:
+        write_theme_colors(colors, config)
+        print(f"Written '{active}' colors to {config.theme_file}")
+    save_palettes(palettes, active, config)
+    if config.apply_command:
+        ok, msg = run_apply_command(config)
+        print(f"  {msg}" if msg else "  (no output)")
+        return 0 if ok else 1
+    print(f"Saved '{active}' as active")
+    return 0
 
 
 def main() -> None:
-    if not THEME_FILE.exists():
-        print(f"Theme file not found: {THEME_FILE}", file=sys.stderr)
-        print("Set CHEZMOI_DIR or THEME_FILE env var to override.", file=sys.stderr)
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        prog="palette-manager",
+        description="TUI for managing color palettes",
+    )
+    parser.add_argument("--config", type=Path, help="Path to config file")
+    parser.add_argument("--check", action="store_true", help="List palettes and exit")
+    parser.add_argument(
+        "--apply", action="store_true", help="Apply active palette (non-interactive)"
+    )
+    parser.add_argument(
+        "--init", action="store_true", help="Create default config file"
+    )
+    args = parser.parse_args()
 
-    if "--check" in sys.argv:
-        sys.exit(check_palettes())
+    if args.init:
+        sys.exit(init_config(args.config))
 
-    if "--apply" in sys.argv:
-        sys.exit(apply_noninteractive())
+    config = load_config(args.config)
 
-    PaletteApp().run()
+    if args.check:
+        sys.exit(check_palettes(config))
+
+    if args.apply:
+        sys.exit(apply_noninteractive(config))
+
+    PaletteApp(config).run()

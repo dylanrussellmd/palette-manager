@@ -1,6 +1,6 @@
 [project]
 name = "palette-manager"
-version = "0.1.0"
+version = "0.2.0"
 description = "TUI for managing color palettes for niri + Quickshell theming"
 readme = "README.md"
 requires-python = ">=3.11"
