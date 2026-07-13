@@ -1,6 +1,6 @@
 [project]
 name = "palette-manager"
-version = "0.2.0"
+version = "0.3.0"
 description = "TUI for managing 16-color base16 palettes with configurable apply behavior"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -10,18 +10,18 @@ A terminal UI for managing 16-color palettes using the [base16](https://github.c
                         │       (user-defined)         │  (editable)
                         └──────────┬──────────────────┘
                                    │
-  base16-schemes.yaml              │
-  (auto-downloaded from       palette-manager
-   tinted-theming/schemes)         │
-  325+ read-only schemes      merges + renders TUI
+   base16-schemes.yaml             │
+   (auto-downloaded from       palette-manager
+    tinted-theming/schemes)        │
+   325+ read-only schemes     merges + renders TUI
                                    │
-                            active palette
+                             active palette
                                    │
-                        writes 32 color keys to
-                        theme_file (base16 + use-names)
+                         writes 32 color keys to
+                         theme_file (base16 + use-names)
                                    │
-                        runs apply_command
-                        (e.g. chezmoi apply, hyprctl reload)
+                         runs apply_command
+                         (e.g. chezmoi apply, hyprctl reload)
 ```
 
 Palette-manager stores palettes in a YAML file and optionally writes the active palette's colors to a separate theme file, then runs a shell command. The specific integration (chezmoi, hyprland, custom script) is defined in a config file.
@@ -163,6 +163,8 @@ palette-manager --config /path/to/config.yaml   # use a specific config
 | Key | Action |
 |---|---|
 | `↑`/`↓` or `k`/`j` | Navigate palettes |
+| `PgUp`/`PgDn` | Scroll by page |
+| `Home`/`End` | Jump to top/bottom |
 | `e` or `Enter` | Edit palette (duplicates if built-in 🔒) |
 | `n` | New palette |
 | `d` | Delete palette (user palettes only) |
@@ -177,16 +179,17 @@ palette-manager --config /path/to/config.yaml   # use a specific config
 
 | Key | Action |
 |---|---|
-| `Tab` | Move between fields |
+| `Tab` / `↓` | Move to next field |
+| `Shift+Tab` / `↑` | Move to previous field |
 | `Ctrl+A` | Autofill from 3 seed colors |
-| `Ctrl+S` or Save | Save |
-| `Esc` or Cancel | Discard |
+| `Ctrl+S` or Save button | Save |
+| `Esc` or Cancel button | Discard |
 
-The edit screen shows all 16 colors with their base16 name and use-name (e.g. `base00 / bg`), a live color swatch, and a hex input field. A live preview panel shows text, accent, and urgent colors on the palette's background.
+The edit screen shows all 16 colors with their base16 name and use-name (e.g. `base00 / bg`), a live color swatch, and a hex input field. A live preview panel shows text, accent, and urgent colors on the palette's background. Use-names are limited to 9 characters to maintain column alignment.
 
 ### Use-name editor
 
-Press `u` from the list screen to rename use-name aliases. This lets you rebind which base16 slot a use-name points to — for example, pointing `accent` at `base0D` instead of `base07`. Changes are saved to `palettes.yaml` and applied on the next `palette-manager --apply`.
+Press `u` from the list screen to rename use-name aliases. This lets you rebind which base16 slot a use-name points to — for example, pointing `accent` at `base0D` instead of `base07`. Changes are saved to `palettes.yaml` and applied on the next `palette-manager --apply`. The use-name editor supports the same `Tab`/`↑`/`↓` keyboard navigation as the edit screen.
 
 ### Search
 
@@ -194,8 +197,9 @@ Press `/` to focus the search bar at the top of the list. Search is fuzzy and ma
 
 - **Name search:** typing `cat` matches "Catppuccin Mocha" (subsequence match, case-insensitive)
 - **Hex search:** typing `f38ba8` matches any palette containing that color value
+- Printable characters are treated as search text while the search bar is focused
+- Navigation keys (`↑`/`↓`, `j`/`k`, `PgUp`/`PgDn`, `Home`/`End`, `Enter`, `Esc`) unfocus the search bar and trigger their normal action
 - Press `Esc` to clear the search and return to the full list
-- Navigation keys (`j`/`k`, `↑`/`↓`) work while searching
 
 ### Display modes
 
@@ -207,7 +211,7 @@ Press `v` to cycle how color information is displayed on each palette card:
 | `base16` | base16 slot names | `base00  base01  base02 …` |
 | `use-names` | Use-name aliases | `bg  surface  selection …` |
 
-The swatch colors are always visible regardless of display mode.
+The swatch colors are always visible regardless of display mode. Swatches and labels are aligned in fixed-width columns and wrap together when the terminal is too narrow to show all 16 at once.
 
 ### Autofill
 
