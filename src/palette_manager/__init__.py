@@ -867,6 +867,10 @@ class PaletteEditScreen(ModalScreen):
         Binding("ctrl+s", "save", "Save"),
         Binding("ctrl+a", "autofill", "Autofill"),
         Binding("escape", "cancel", "Cancel"),
+        Binding("up", "focus_prev", "↑", show=False, priority=True),
+        Binding("down", "focus_next", "↓", show=False, priority=True),
+        Binding("tab", "focus_next", "Tab", show=False, priority=True),
+        Binding("shift+tab", "focus_prev", "Shift+Tab", show=False, priority=True),
     ]
 
     def __init__(
@@ -907,6 +911,41 @@ class PaletteEditScreen(ModalScreen):
 
     def on_mount(self) -> None:
         self._update_preview()
+
+    def _focusable_inputs(self) -> list[Input]:
+        """Return all Input widgets in tab order."""
+        inputs = []
+        try:
+            inputs.append(self.query_one("#palette-name", Input))
+        except Exception:
+            pass
+        for key in BASE16_KEYS:
+            try:
+                inputs.append(self.query_one(f"#color-{key}", Input))
+            except Exception:
+                pass
+        return inputs
+
+    def action_focus_next(self) -> None:
+        inputs = self._focusable_inputs()
+        if not inputs:
+            return
+        current = self.focused
+        for i, inp in enumerate(inputs):
+            if inp.has_focus:
+                inputs[(i + 1) % len(inputs)].focus()
+                return
+        inputs[0].focus()
+
+    def action_focus_prev(self) -> None:
+        inputs = self._focusable_inputs()
+        if not inputs:
+            return
+        for i, inp in enumerate(inputs):
+            if inp.has_focus:
+                inputs[(i - 1) % len(inputs)].focus()
+                return
+        inputs[-1].focus()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         input_id = event.input.id or ""
@@ -1060,6 +1099,10 @@ class UsesEditScreen(ModalScreen):
     BINDINGS = [
         Binding("ctrl+s", "save", "Save"),
         Binding("escape", "cancel", "Cancel"),
+        Binding("up", "focus_prev", "↑", show=False, priority=True),
+        Binding("down", "focus_next", "↓", show=False, priority=True),
+        Binding("tab", "focus_next", "Tab", show=False, priority=True),
+        Binding("shift+tab", "focus_prev", "Shift+Tab", show=False, priority=True),
     ]
 
     def __init__(self, uses: dict) -> None:
@@ -1085,6 +1128,36 @@ class UsesEditScreen(ModalScreen):
             with Horizontal(classes="button-row"):
                 yield Button("Save", id="save-btn", variant="success")
                 yield Button("Cancel", id="cancel-btn", variant="error")
+
+    def _focusable_inputs(self) -> list[Input]:
+        """Return all Input widgets in order."""
+        inputs = []
+        for key in BASE16_KEYS:
+            try:
+                inputs.append(self.query_one(f"#use-{key}", Input))
+            except Exception:
+                pass
+        return inputs
+
+    def action_focus_next(self) -> None:
+        inputs = self._focusable_inputs()
+        if not inputs:
+            return
+        for i, inp in enumerate(inputs):
+            if inp.has_focus:
+                inputs[(i + 1) % len(inputs)].focus()
+                return
+        inputs[0].focus()
+
+    def action_focus_prev(self) -> None:
+        inputs = self._focusable_inputs()
+        if not inputs:
+            return
+        for i, inp in enumerate(inputs):
+            if inp.has_focus:
+                inputs[(i - 1) % len(inputs)].focus()
+                return
+        inputs[-1].focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "save-btn":
