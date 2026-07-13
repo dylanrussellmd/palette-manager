@@ -1308,7 +1308,8 @@ class PaletteApp(App):
 
     def on_resize(self, event) -> None:
         """Re-render list when terminal is resized."""
-        self._render_list()
+        # Use set_timer(0) to defer until after Textual finishes layout
+        self.set_timer(0, self._render_list)
 
     # ── Layout helpers ────────────────────────────────────────────
 
