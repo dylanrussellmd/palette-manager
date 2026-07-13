@@ -85,6 +85,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.color import Color
 from textual.containers import Container, Horizontal, VerticalScroll
+from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widget import Widget
@@ -667,6 +668,48 @@ class ColorSwatch(Static):
             pass
 
 
+# ── Search input (lets action keys through) ───────────────────────
+
+
+# Keys that should escape the search bar and trigger app actions.
+# Only non-printable keys — printable chars are search text while focused.
+_SEARCH_ESCAPE_KEYS = frozenset(
+    {
+        "up",
+        "down",
+        "left",
+        "right",
+        "pageup",
+        "pagedown",
+        "home",
+        "end",
+        "enter",
+        "escape",
+    }
+)
+
+
+class SearchInput(Input):
+    """Input widget that lets navigation/action keys escape to the app."""
+
+    class SearchExit(Message):
+        """Posted when a navigation/action key is pressed in the search bar."""
+
+        def __init__(self, key: str) -> None:
+            self.key = key
+            super().__init__()
+
+    async def _on_key(self, event) -> None:
+        # Let non-printable nav keys escape
+        if event.key in _SEARCH_ESCAPE_KEYS:
+            self.post_message(self.SearchExit(event.key))
+            event.stop()
+            event.prevent_default()
+            return
+        # Otherwise, normal Input behavior
+        await super()._on_key(event)
+
+
 # ── Palette card (list screen rows) ──────────────────────────────
 
 
@@ -831,7 +874,7 @@ class PaletteEditScreen(ModalScreen):
     ) -> None:
         super().__init__()
         self.original_name = name
-        self.colors = dict(colors)
+        self.palette_colors = dict(colors)
         self.uses = dict(uses)
         self.is_new = is_new
 
@@ -847,7 +890,7 @@ class PaletteEditScreen(ModalScreen):
             yield Label(" COLORS", classes="section-label")
             with VerticalScroll(id="color-scroll"):
                 for key in BASE16_KEYS:
-                    hex_val = self.colors.get(key, "#000000")
+                    hex_val = self.palette_colors.get(key, "#000000")
                     use_name = self.uses.get(key, key) if hasattr(self, "uses") else key
                     with Horizontal(classes="color-row"):
                         yield Label(f"{key} / {use_name}", classes="color-label")
@@ -933,9 +976,9 @@ class PaletteEditScreen(ModalScreen):
             try:
                 colors[key] = self.query_one(
                     f"#color-{key}", Input
-                ).value.strip() or self.colors.get(key, "#000000")
+                ).value.strip() or self.palette_colors.get(key, "#000000")
             except Exception:
-                colors[key] = self.colors.get(key, "#000000")
+                colors[key] = self.palette_colors.get(key, "#000000")
         return colors
 
     def _get_name(self) -> str:
@@ -1108,6 +1151,8 @@ class PaletteApp(App):
     TITLE = "Palette Manager"
     SUB_TITLE = ""  # set in __init__
 
+    ENABLE_COMMAND_PALETTE = False
+
     CSS = """
     #palette-list {
         height: 1fr;
@@ -1125,14 +1170,14 @@ class PaletteApp(App):
     """
 
     BINDINGS = [
-        Binding("up", "navigate(-1)", "↑", show=False, priority=True),
-        Binding("down", "navigate(1)", "↓", show=False, priority=True),
-        Binding("k", "navigate(-1)", show=False, priority=True),
-        Binding("j", "navigate(1)", show=False, priority=True),
-        Binding("pageup", "page_up", "PgUp", show=False, priority=True),
-        Binding("pagedown", "page_down", "PgDn", show=False, priority=True),
-        Binding("home", "scroll_top", "Home", show=False, priority=True),
-        Binding("end", "scroll_bottom", "End", show=False, priority=True),
+        Binding("up", "navigate(-1)", show=False),
+        Binding("down", "navigate(1)", show=False),
+        Binding("k", "navigate(-1)", show=False),
+        Binding("j", "navigate(1)", show=False),
+        Binding("pageup", "page_up", show=False),
+        Binding("pagedown", "page_down", show=False),
+        Binding("home", "scroll_top", show=False),
+        Binding("end", "scroll_bottom", show=False),
         Binding("enter", "edit", "Edit", show=False),
         Binding("e", "edit", "Edit"),
         Binding("n", "new", "New"),
@@ -1140,9 +1185,8 @@ class PaletteApp(App):
         Binding("u", "edit_uses", "Use-names"),
         Binding("v", "cycle_display", "View"),
         Binding("a", "activate", "Activate"),
+        Binding("/", "focus_search", "Search"),
         Binding("q", "quit", "Quit"),
-        Binding("ctrl+p", "noop", show=False),
-        Binding("/", "focus_search", "Search", show=False),
         Binding("escape", "blur_search", show=False),
     ]
 
@@ -1171,14 +1215,19 @@ class PaletteApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="search-bar"):
-            yield Input(
+            yield SearchInput(
                 placeholder="Search palettes by name or hex code…  (/ to focus, Esc to clear)",
                 id="search-input",
             )
         yield Static(id="palette-list")
-        yield Footer()
+        yield Footer(show_command_palette=False)
 
     def on_mount(self) -> None:
+        # Make the list non-focusable so app-level bindings reach the Footer
+        self.query_one("#palette-list", Static).can_focus = False
+        # Prevent the Input from auto-focusing (which would capture all
+        # single-char key presses as text input, hiding our e/n/d/u/v/a/q bindings)
+        self.call_after_refresh(lambda: self.set_focus(None))
         self._render_list()
         self._update_base16_schemes()
 
@@ -1318,7 +1367,7 @@ class PaletteApp(App):
         """Append a single card to the text buffer."""
         prefix = "> " if is_selected else "  "
         marker = "  *" if is_active else ""
-        lock = "  (lock)" if is_readonly else ""
+        lock = "  🔒" if is_readonly else ""
         name_style = "bold" if is_selected else ""
         if is_readonly and not is_selected:
             name_style = "dim"
@@ -1361,24 +1410,29 @@ class PaletteApp(App):
     # ── Actions: navigation ───────────────────────────────────────
 
     def action_navigate(self, delta: int) -> None:
+        self._unfocus_search()
         total = len(self._filtered_list())
         max_idx = max(total - 1, 0)
         self.selected_index = max(0, min(self.selected_index + delta, max_idx))
 
     def action_page_up(self) -> None:
+        self._unfocus_search()
         vis = self._visible_count()
         self.selected_index = max(0, self.selected_index - vis)
 
     def action_page_down(self) -> None:
+        self._unfocus_search()
         total = len(self._filtered_list())
         vis = self._visible_count()
         self.selected_index = min(total - 1, self.selected_index + vis)
 
     def action_scroll_top(self) -> None:
+        self._unfocus_search()
         self.selected_index = 0
         self.scroll_offset = 0
 
     def action_scroll_bottom(self) -> None:
+        self._unfocus_search()
         total = len(self._filtered_list())
         self.selected_index = max(0, total - 1)
 
@@ -1390,19 +1444,55 @@ class PaletteApp(App):
         except Exception:
             pass
 
-    def action_blur_search(self) -> None:
+    def _unfocus_search(self) -> bool:
+        """Unfocus the search bar if it's focused. Returns True if it was focused."""
         try:
             search_input = self.query_one("#search-input", Input)
-            if search_input.focused:
-                search_input.value = ""
-                self.search_query = ""
-                self.selected_index = 0
-                self.scroll_offset = 0
-                self._filter_cache = None
-                self._render_list()
-                self.query_one("#palette-list", Static).focus()
+            if search_input.has_focus:
+                self.set_focus(None)
+                return True
         except Exception:
             pass
+        return False
+
+    def action_blur_search(self) -> None:
+        """Clear search and unfocus."""
+        if self._unfocus_search():
+            try:
+                self.query_one("#search-input", Input).value = ""
+            except Exception:
+                pass
+            self.search_query = ""
+            self.selected_index = 0
+            self.scroll_offset = 0
+            self._filter_cache = None
+            self._render_list()
+
+    async def on_search_input_search_exit(self, event) -> None:
+        """Handle nav/action keys pressed while search bar is focused."""
+        self._unfocus_search()
+        key = event.key
+        key_to_action = {
+            "up": "navigate(-1)",
+            "down": "navigate(1)",
+            "pageup": "page_up",
+            "pagedown": "page_down",
+            "home": "scroll_top",
+            "end": "scroll_bottom",
+            "enter": "edit",
+            "escape": "blur_search",
+            "e": "edit",
+            "n": "new",
+            "d": "delete",
+            "u": "edit_uses",
+            "v": "cycle_display",
+            "a": "activate",
+            "q": "quit",
+            "/": "focus_search",
+        }
+        action = key_to_action.get(key)
+        if action:
+            await self.run_action(action)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         """Handle search input with 150ms debounce."""
@@ -1425,6 +1515,7 @@ class PaletteApp(App):
     # ── Actions: display mode ─────────────────────────────────────
 
     def action_cycle_display(self) -> None:
+        self._unfocus_search()
         idx = self.DISPLAY_MODES.index(self.display_mode)
         self.display_mode = self.DISPLAY_MODES[(idx + 1) % len(self.DISPLAY_MODES)]
         self.notify(f"View: {self.DISPLAY_LABELS[self.display_mode]}", timeout=2)
@@ -1446,6 +1537,7 @@ class PaletteApp(App):
     # ── Actions: palette management ───────────────────────────────
 
     def action_edit(self) -> None:
+        self._unfocus_search()
         name = self._selected_name()
         if name is None:
             return
@@ -1500,6 +1592,7 @@ class PaletteApp(App):
         )
 
     def action_new(self) -> None:
+        self._unfocus_search()
         default_colors = dict(SEED_PALETTES["Catppuccin Mocha"])
         base = "New Palette"
         name = base
@@ -1526,6 +1619,7 @@ class PaletteApp(App):
         )
 
     def action_delete(self) -> None:
+        self._unfocus_search()
         name = self._selected_name()
         if name is None:
             return
@@ -1551,6 +1645,8 @@ class PaletteApp(App):
         self.notify(f"Deleted '{name}'", timeout=2)
 
     def action_edit_uses(self) -> None:
+        self._unfocus_search()
+
         def on_result(result):
             if result is None:
                 return
@@ -1562,6 +1658,7 @@ class PaletteApp(App):
         self.push_screen(UsesEditScreen(self.uses), on_result)
 
     def action_activate(self) -> None:
+        self._unfocus_search()
         name = self._selected_name()
         if name is None:
             return
@@ -1582,9 +1679,6 @@ class PaletteApp(App):
                 self.notify(msg, timeout=5, severity="error")
         else:
             self.notify(f"Saved '{name}' as active", timeout=2)
-
-    def action_noop(self) -> None:
-        pass
 
 
 # ── CLI entry points ─────────────────────────────────────────────
