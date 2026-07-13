@@ -78,6 +78,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from hsluv import hex_to_hsluv, hsluv_to_hex
+from rich.style import Style
+from rich.text import Text
 from ruamel.yaml import YAML
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -1109,7 +1111,8 @@ class PaletteApp(App):
     CSS = """
     #palette-list {
         height: 1fr;
-        padding: 1 2;
+        padding: 0 1;
+        overflow-y: hidden;
     }
     #search-bar {
         height: 3;
@@ -1126,6 +1129,10 @@ class PaletteApp(App):
         Binding("down", "navigate(1)", "↓", show=False, priority=True),
         Binding("k", "navigate(-1)", show=False, priority=True),
         Binding("j", "navigate(1)", show=False, priority=True),
+        Binding("pageup", "page_up", "PgUp", show=False, priority=True),
+        Binding("pagedown", "page_down", "PgDn", show=False, priority=True),
+        Binding("home", "scroll_top", "Home", show=False, priority=True),
+        Binding("end", "scroll_bottom", "End", show=False, priority=True),
         Binding("enter", "edit", "Edit", show=False),
         Binding("e", "edit", "Edit"),
         Binding("n", "new", "New"),
@@ -1142,7 +1149,9 @@ class PaletteApp(App):
     selected_index = reactive(0)
     display_mode = reactive("hex")
     search_query = reactive("")
+    scroll_offset = reactive(0)
 
+    CARD_HEIGHT = 4
     DISPLAY_MODES = ["hex", "base16", "use"]
     DISPLAY_LABELS = {"hex": "hex", "base16": "base16", "use": "use-names"}
 
@@ -1154,6 +1163,8 @@ class PaletteApp(App):
         )
         self.readonly = set(self.base16_schemes.keys())
         self.SUB_TITLE = str(config.palettes_file)
+        self._filter_cache: tuple[str, list[tuple[str, dict]]] | None = None
+        self._search_counter = 0
 
     # ── Compose ───────────────────────────────────────────────────
 
@@ -1164,27 +1175,11 @@ class PaletteApp(App):
                 placeholder="Search palettes by name or hex code…  (/ to focus, Esc to clear)",
                 id="search-input",
             )
-        with VerticalScroll(id="palette-list"):
-            for i, (name, colors) in enumerate(self._filtered_palettes().items()):
-                is_readonly = name in self.readonly
-                card = PaletteCard(
-                    name,
-                    colors,
-                    is_active=(name == self.active_palette),
-                    is_readonly=is_readonly,
-                    display_mode=self.display_mode,
-                    uses=self.uses,
-                )
-                if i == self.selected_index:
-                    card.add_class("-selected")
-                yield card
+        yield Static(id="palette-list")
         yield Footer()
 
     def on_mount(self) -> None:
-        scroll = self.query_one("#palette-list", VerticalScroll)
-        scroll.can_focus = False
-        self._refresh_cards()
-        # Check for base16 scheme updates in the background
+        self._render_list()
         self._update_base16_schemes()
 
     def _update_base16_schemes(self) -> None:
@@ -1196,21 +1191,21 @@ class PaletteApp(App):
             if updated and count > 0:
                 self.base16_schemes = load_base16_schemes(self.config)
                 self.readonly = set(self.base16_schemes.keys())
+                self._invalidate_cache()
                 self.call_from_thread(self._on_base16_updated, count)
             elif err and not self.base16_schemes:
-                pass  # silent failure, no cache
+                pass
 
         thread = threading.Thread(target=do_update, daemon=True)
         thread.start()
 
     def _on_base16_updated(self, count: int) -> None:
-        self._refresh_cards()
+        self._render_list()
         self.notify(f"Updated {count} base16 schemes", timeout=3)
 
-    # ── Rendering ─────────────────────────────────────────────────
+    # ── Data helpers ──────────────────────────────────────────────
 
     def _all_palettes(self) -> dict:
-        """Merge user palettes + base16 schemes (user first)."""
         all_palettes = {}
         all_palettes.update(self.palettes)
         for name, colors in self.base16_schemes.items():
@@ -1218,116 +1213,32 @@ class PaletteApp(App):
                 all_palettes[name] = colors
         return all_palettes
 
-    def _filtered_palettes(self) -> dict:
-        """Return palettes filtered by the current search query."""
+    def _filtered_list(self) -> list[tuple[str, dict]]:
+        """Return filtered palettes as a list of (name, colors) tuples. Cached."""
+        if (
+            self._filter_cache is not None
+            and self._filter_cache[0] == self.search_query
+        ):
+            return self._filter_cache[1]
         all_palettes = self._all_palettes()
         if not self.search_query:
-            return all_palettes
-        return {
-            name: colors
-            for name, colors in all_palettes.items()
-            if palette_matches(self.search_query, name, colors)
-        }
+            result = list(all_palettes.items())
+        else:
+            result = [
+                (name, colors)
+                for name, colors in all_palettes.items()
+                if palette_matches(self.search_query, name, colors)
+            ]
+        self._filter_cache = (self.search_query, result)
+        return result
 
-    def _refresh_cards(self) -> None:
-        """Full rebuild of the palette list."""
-        scroll = self.query_one("#palette-list", VerticalScroll)
-        scroll.remove_children()
-        filtered = self._filtered_palettes()
-        if self.selected_index >= len(filtered):
-            self.selected_index = max(0, len(filtered) - 1)
-        for i, (name, colors) in enumerate(filtered.items()):
-            is_readonly = name in self.readonly
-            card = PaletteCard(
-                name,
-                colors,
-                is_active=(name == self.active_palette),
-                is_readonly=is_readonly,
-                display_mode=self.display_mode,
-                uses=self.uses,
-            )
-            if i == self.selected_index:
-                card.add_class("-selected")
-            scroll.mount(card)
-        self._scroll_to_selected()
-
-    def _update_selection(self) -> None:
-        """Lightweight CSS-only update for navigation."""
-        try:
-            scroll = self.query_one("#palette-list", VerticalScroll)
-        except Exception:
-            return  # DOM not ready yet
-        for i, card in enumerate(scroll.children):
-            if isinstance(card, PaletteCard):
-                card.set_class(i == self.selected_index, "-selected")
-
-    def _scroll_to_selected(self) -> None:
-        """Keep the selected card scrolled into view."""
-        try:
-            scroll = self.query_one("#palette-list", VerticalScroll)
-            cards = [c for c in scroll.children if isinstance(c, PaletteCard)]
-            if 0 <= self.selected_index < len(cards):
-                scroll.scroll_to_widget(cards[self.selected_index], animate=False)
-        except Exception:
-            pass
-
-    def watch_selected_index(self, _idx: int) -> None:
-        self._update_selection()
-        self._scroll_to_selected()
-
-    # ── Actions ───────────────────────────────────────────────────
-
-    def action_navigate(self, delta: int) -> None:
-        names = self._palette_names()
-        max_idx = max(len(names) - 1, 0)
-        self.selected_index = max(0, min(self.selected_index + delta, max_idx))
-
-    def action_focus_search(self) -> None:
-        """Focus the search input."""
-        try:
-            self.query_one("#search-input", Input).focus()
-        except Exception:
-            pass
-
-    def action_blur_search(self) -> None:
-        """Clear search and return focus to the list."""
-        try:
-            search_input = self.query_one("#search-input", Input)
-            if search_input.focused:
-                search_input.value = ""
-                self.search_query = ""
-                self.selected_index = 0
-                self._refresh_cards()
-                self.query_one("#palette-list", VerticalScroll).focus()
-            else:
-                # Esc in the main list — do nothing (let Textual handle it)
-                pass
-        except Exception:
-            pass
-
-    def on_input_changed(self, event: Input.Changed) -> None:
-        """Handle search input changes."""
-        if event.input.id == "search-input":
-            self.search_query = event.value.strip()
-            self.selected_index = 0
-            self._refresh_cards()
-
-    def action_cycle_display(self) -> None:
-        """Cycle through display modes: hex → base16 → use-names → hex."""
-        idx = self.DISPLAY_MODES.index(self.display_mode)
-        self.display_mode = self.DISPLAY_MODES[(idx + 1) % len(self.DISPLAY_MODES)]
-        self._refresh_cards()
-        self.notify(f"View: {self.DISPLAY_LABELS[self.display_mode]}", timeout=2)
-
-    def watch_display_mode(self, _mode: str) -> None:
-        """Refresh cards when display mode changes."""
-        pass  # refresh handled by action_cycle_display
+    def _invalidate_cache(self) -> None:
+        self._filter_cache = None
 
     def _palette_names(self) -> list[str]:
-        return list(self._filtered_palettes().keys())
+        return [name for name, _ in self._filtered_list()]
 
     def _get_palette_colors(self, name: str) -> dict:
-        """Get colors for a palette name (user or base16)."""
         if name in self.palettes:
             return self.palettes[name]
         if name in self.base16_schemes:
@@ -1335,23 +1246,214 @@ class PaletteApp(App):
         return {}
 
     def _selected_name(self) -> str | None:
-        names = self._palette_names()
-        if not names:
+        filtered = self._filtered_list()
+        if not filtered:
             return None
-        idx = min(self.selected_index, len(names) - 1)
-        return names[idx]
+        idx = min(self.selected_index, len(filtered) - 1)
+        return filtered[idx][0]
+
+    # ── Virtualized rendering ─────────────────────────────────────
+
+    def _visible_count(self) -> int:
+        try:
+            widget = self.query_one("#palette-list", Static)
+            height = widget.size.height
+            if height <= 0:
+                height = 40
+            return max(1, height // self.CARD_HEIGHT)
+        except Exception:
+            return 10
+
+    def _render_list(self) -> None:
+        """Render the visible window of palette cards into the Static widget."""
+        try:
+            widget = self.query_one("#palette-list", Static)
+        except Exception:
+            return
+
+        filtered = self._filtered_list()
+        total = len(filtered)
+
+        if total == 0:
+            widget.update(Text("[dim]No palettes match search[/]"))
+            return
+        if self.selected_index >= total:
+            self.selected_index = total - 1
+        if self.selected_index < 0:
+            self.selected_index = 0
+
+        vis = self._visible_count()
+        if self.scroll_offset > self.selected_index:
+            self.scroll_offset = self.selected_index
+        elif self.scroll_offset + vis <= self.selected_index:
+            self.scroll_offset = self.selected_index - vis + 1
+        if self.scroll_offset < 0:
+            self.scroll_offset = 0
+
+        start = self.scroll_offset
+        end = min(start + vis, total)
+
+        text = Text()
+        for i in range(start, end):
+            name, colors = filtered[i]
+            is_active = name == self.active_palette
+            is_readonly = name in self.readonly
+            is_selected = i == self.selected_index
+            self._render_card(text, name, colors, is_active, is_readonly, is_selected)
+
+        if total > vis:
+            text.append(Text(f"\n  {start + 1}-{end} of {total}", style="dim"))
+
+        widget.update(text)
+
+    def _render_card(
+        self,
+        text: Text,
+        name: str,
+        colors: dict,
+        is_active: bool,
+        is_readonly: bool,
+        is_selected: bool,
+    ) -> None:
+        """Append a single card to the text buffer."""
+        prefix = "> " if is_selected else "  "
+        marker = "  *" if is_active else ""
+        lock = "  (lock)" if is_readonly else ""
+        name_style = "bold" if is_selected else ""
+        if is_readonly and not is_selected:
+            name_style = "dim"
+        text.append(Text(f"{prefix}{name}{marker}{lock}\n", style=name_style))
+
+        text.append("  ")
+        for key in BASE16_KEYS:
+            hex_val = colors.get(key, "#000000")
+            h = hex_val.lstrip("#")
+            if len(h) == 8:
+                h = h[:6]
+            try:
+                style = Style(bgcolor=f"#{h}")
+            except Exception:
+                style = Style()
+            text.append(" " * 7, style=style)
+            text.append("  ")
+        text.append("\n")
+
+        if self.display_mode == "base16":
+            info = "  ".join(BASE16_KEYS)
+        elif self.display_mode == "use":
+            info = "  ".join(self.uses.get(k, k) for k in BASE16_KEYS)
+        else:
+            info = "  ".join(colors.get(k, "???") for k in BASE16_KEYS)
+        text.append(Text(f"  {info}\n", style="dim"))
+        text.append("\n")
+
+    # ── Reactive watchers ─────────────────────────────────────────
+
+    def watch_selected_index(self, _idx: int) -> None:
+        self._render_list()
+
+    def watch_scroll_offset(self, _idx: int) -> None:
+        self._render_list()
+
+    def watch_display_mode(self, _mode: str) -> None:
+        self._render_list()
+
+    # ── Actions: navigation ───────────────────────────────────────
+
+    def action_navigate(self, delta: int) -> None:
+        total = len(self._filtered_list())
+        max_idx = max(total - 1, 0)
+        self.selected_index = max(0, min(self.selected_index + delta, max_idx))
+
+    def action_page_up(self) -> None:
+        vis = self._visible_count()
+        self.selected_index = max(0, self.selected_index - vis)
+
+    def action_page_down(self) -> None:
+        total = len(self._filtered_list())
+        vis = self._visible_count()
+        self.selected_index = min(total - 1, self.selected_index + vis)
+
+    def action_scroll_top(self) -> None:
+        self.selected_index = 0
+        self.scroll_offset = 0
+
+    def action_scroll_bottom(self) -> None:
+        total = len(self._filtered_list())
+        self.selected_index = max(0, total - 1)
+
+    # ── Actions: search ───────────────────────────────────────────
+
+    def action_focus_search(self) -> None:
+        try:
+            self.query_one("#search-input", Input).focus()
+        except Exception:
+            pass
+
+    def action_blur_search(self) -> None:
+        try:
+            search_input = self.query_one("#search-input", Input)
+            if search_input.focused:
+                search_input.value = ""
+                self.search_query = ""
+                self.selected_index = 0
+                self.scroll_offset = 0
+                self._filter_cache = None
+                self._render_list()
+                self.query_one("#palette-list", Static).focus()
+        except Exception:
+            pass
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Handle search input with 150ms debounce."""
+        if event.input.id != "search-input":
+            return
+        self._search_counter += 1
+        current = self._search_counter
+        value = event.value
+        self.set_timer(0.15, lambda: self._do_search(value, current))
+
+    def _do_search(self, value: str, expected: int) -> None:
+        if expected != self._search_counter:
+            return
+        self.search_query = value.strip()
+        self.selected_index = 0
+        self.scroll_offset = 0
+        self._filter_cache = None
+        self._render_list()
+
+    # ── Actions: display mode ─────────────────────────────────────
+
+    def action_cycle_display(self) -> None:
+        idx = self.DISPLAY_MODES.index(self.display_mode)
+        self.display_mode = self.DISPLAY_MODES[(idx + 1) % len(self.DISPLAY_MODES)]
+        self.notify(f"View: {self.DISPLAY_LABELS[self.display_mode]}", timeout=2)
+
+    # ── Actions: mouse ────────────────────────────────────────────
+
+    def on_click(self, event) -> None:
+        """Click on the palette list selects the card at that y position."""
+        if event.widget and event.widget.id == "palette-list":
+            try:
+                rel_y = event.y - event.widget.gutter.top
+            except Exception:
+                rel_y = event.y
+            card_idx = self.scroll_offset + rel_y // self.CARD_HEIGHT
+            total = len(self._filtered_list())
+            if 0 <= card_idx < total:
+                self.selected_index = card_idx
+
+    # ── Actions: palette management ───────────────────────────────
 
     def action_edit(self) -> None:
         name = self._selected_name()
         if name is None:
             return
 
-        # If read-only (base16), duplicate first
         if name in self.readonly:
             self._duplicate_palette(name)
             return
 
-        # Normal edit flow for user palettes
         def on_result(result):
             if result is None:
                 return
@@ -1361,8 +1463,9 @@ class PaletteApp(App):
                 if self.active_palette == name:
                     self.active_palette = new_name
             self.palettes[new_name] = new_colors
+            self._invalidate_cache()
             save_palettes(self.palettes, self.active_palette, self.uses, self.config)
-            self._refresh_cards()
+            self._render_list()
             self.notify(f"Saved '{new_name}'", timeout=2)
 
         self.push_screen(
@@ -1371,10 +1474,7 @@ class PaletteApp(App):
         )
 
     def _duplicate_palette(self, source_name: str) -> None:
-        """Duplicate a read-only palette and open the editor."""
         source_colors = self._get_palette_colors(source_name)
-
-        # Generate unique name
         base_name = f"{source_name} (copy)"
         new_name = base_name
         n = 2
@@ -1388,10 +1488,11 @@ class PaletteApp(App):
                 return
             final_name, new_colors = result
             self.palettes[final_name] = new_colors
+            self._invalidate_cache()
             save_palettes(self.palettes, self.active_palette, self.uses, self.config)
-            self.selected_index = list(self._palette_names()).index(final_name)
-            self._refresh_cards()
-            self.notify(f"Duplicated '{source_name}' → '{final_name}'", timeout=3)
+            self.selected_index = self._palette_names().index(final_name)
+            self._render_list()
+            self.notify(f"Duplicated '{source_name}' -> '{final_name}'", timeout=3)
 
         self.push_screen(
             PaletteEditScreen(new_name, source_colors, self.uses, is_new=True),
@@ -1413,9 +1514,10 @@ class PaletteApp(App):
                 return
             new_name, new_colors = result
             self.palettes[new_name] = new_colors
+            self._invalidate_cache()
             save_palettes(self.palettes, self.active_palette, self.uses, self.config)
-            self.selected_index = list(self._palette_names()).index(new_name)
-            self._refresh_cards()
+            self.selected_index = self._palette_names().index(new_name)
+            self._render_list()
             self.notify(f"Created '{new_name}'", timeout=2)
 
         self.push_screen(
@@ -1443,43 +1545,35 @@ class PaletteApp(App):
             self.active_palette = next(iter(all_palettes)) if all_palettes else ""
         if self.selected_index >= len(self._palette_names()):
             self.selected_index = max(0, len(self._palette_names()) - 1)
+        self._invalidate_cache()
         save_palettes(self.palettes, self.active_palette, self.uses, self.config)
-        self._refresh_cards()
+        self._render_list()
         self.notify(f"Deleted '{name}'", timeout=2)
 
     def action_edit_uses(self) -> None:
-        """Open the use-name editor."""
-
         def on_result(result):
             if result is None:
                 return
             self.uses = result
             save_palettes(self.palettes, self.active_palette, self.uses, self.config)
-            self._refresh_cards()
+            self._render_list()
             self.notify("Updated use-names", timeout=2)
 
         self.push_screen(UsesEditScreen(self.uses), on_result)
 
     def action_activate(self) -> None:
-        """Set selected palette as active, write colors, and run apply command."""
         name = self._selected_name()
         if name is None:
             return
         self.active_palette = name
         colors = self._get_palette_colors(name)
-
-        # Write to theme file if configured
         if self.config.theme_file is not None:
             write_theme_colors(colors, self.config, self.uses)
-
         save_palettes(self.palettes, self.active_palette, self.uses, self.config)
-        self._refresh_cards()
-
-        # Run apply command if configured
+        self._render_list()
         if self.config.apply_command:
             self.notify(
-                f"Applied '{name}' — running {self.config.apply_command}...",
-                timeout=3,
+                f"Applied '{name}' — running {self.config.apply_command}...", timeout=3
             )
             ok, msg = run_apply_command(self.config)
             if ok and msg:
@@ -1490,7 +1584,6 @@ class PaletteApp(App):
             self.notify(f"Saved '{name}' as active", timeout=2)
 
     def action_noop(self) -> None:
-        """Suppress Textual's built-in command palette (Ctrl+P)."""
         pass
 
 
