@@ -69,7 +69,6 @@ from __future__ import annotations
 
 import argparse
 import io
-import math
 import subprocess
 import sys
 import tarfile
@@ -855,7 +854,7 @@ class PaletteEditScreen(ModalScreen):
     }
     PaletteEditScreen .button-row {
         height: 3;
-        padding: 1 2 0 2;
+        padding: 0 2;
         align: center middle;
     }
     PaletteEditScreen .button-row Button {
@@ -1083,7 +1082,6 @@ class UsesEditScreen(ModalScreen):
     }
     UsesEditScreen .use-input {
         width: 30;
-        max-width: 30;
     }
     UsesEditScreen #use-scroll {
         height: 1fr;
@@ -1092,7 +1090,7 @@ class UsesEditScreen(ModalScreen):
     }
     UsesEditScreen .button-row {
         height: 3;
-        padding: 1 2 0 2;
+        padding: 0 2;
         align: center middle;
     }
     UsesEditScreen .button-row Button {
@@ -1132,10 +1130,7 @@ class UsesEditScreen(ModalScreen):
                         yield Label(key, classes="base16-label")
                         yield Label("→", classes="arrow")
                         yield Input(
-                            value=use_name,
-                            id=f"use-{key}",
-                            classes="use-input",
-                            max_length=9,
+                            value=use_name, id=f"use-{key}", classes="use-input"
                         )
             with Horizontal(classes="button-row"):
                 yield Button("Save", id="save-btn", variant="success")
@@ -1289,9 +1284,7 @@ class PaletteApp(App):
     search_query = reactive("")
     scroll_offset = reactive(0)
 
-    SWATCH_WIDTH = 9  # chars per swatch column (max of hex=7, base16=6, use-name=9)
-    SWATCH_GAP = 2  # chars between columns
-    INDENT = 2  # left indent for swatch/label lines
+    CARD_HEIGHT = 4
     DISPLAY_MODES = ["hex", "base16", "use"]
     DISPLAY_LABELS = {"hex": "hex", "base16": "base16", "use": "use-names"}
 
@@ -1305,31 +1298,6 @@ class PaletteApp(App):
         self.SUB_TITLE = str(config.palettes_file)
         self._filter_cache: tuple[str, list[tuple[str, dict]]] | None = None
         self._search_counter = 0
-
-    def on_resize(self, event) -> None:
-        """Re-render list when terminal is resized."""
-        # Use set_timer(0) to defer until after Textual finishes layout
-        self.set_timer(0, self._render_list)
-
-    # ── Layout helpers ────────────────────────────────────────────
-
-    def _calc_cols(self) -> int:
-        """How many color columns fit in the terminal width."""
-        try:
-            widget = self.query_one("#palette-list", Static)
-            width = widget.size.width
-            if width <= 0:
-                width = 80
-        except Exception:
-            width = 80
-        col_total = self.SWATCH_WIDTH + self.SWATCH_GAP
-        return max(1, min(16, (width - self.INDENT) // col_total))
-
-    def _card_height(self) -> int:
-        """Dynamic card height based on terminal width."""
-        cols = self._calc_cols()
-        rows = math.ceil(16 / cols)
-        return 1 + 2 * rows + 1  # name + (swatch + label) * rows + blank
 
     # ── Compose ───────────────────────────────────────────────────
 
@@ -1430,7 +1398,7 @@ class PaletteApp(App):
             height = widget.size.height
             if height <= 0:
                 height = 40
-            return max(1, height // self._card_height())
+            return max(1, height // self.CARD_HEIGHT)
         except Exception:
             return 10
 
@@ -1494,43 +1462,27 @@ class PaletteApp(App):
             name_style = "dim"
         text.append(Text(f"{prefix}{name}{marker}{lock}\n", style=name_style))
 
-        # Split 16 colors into rows that fit the terminal width
-        cols = self._calc_cols()
-        col_width = self.SWATCH_WIDTH + self.SWATCH_GAP
+        text.append("  ")
+        for key in BASE16_KEYS:
+            hex_val = colors.get(key, "#000000")
+            h = hex_val.lstrip("#")
+            if len(h) == 8:
+                h = h[:6]
+            try:
+                style = Style(bgcolor=f"#{h}")
+            except Exception:
+                style = Style()
+            text.append(" " * 7, style=style)
+            text.append("  ")
+        text.append("\n")
 
-        for row_start in range(0, 16, cols):
-            row_end = min(row_start + cols, 16)
-            row_keys = BASE16_KEYS[row_start:row_end]
-
-            # Swatch line
-            text.append(" " * self.INDENT)
-            for key in row_keys:
-                hex_val = colors.get(key, "#000000")
-                h = hex_val.lstrip("#")
-                if len(h) == 8:
-                    h = h[:6]
-                try:
-                    style = Style(bgcolor=f"#{h}")
-                except Exception:
-                    style = Style()
-                text.append(" " * self.SWATCH_WIDTH, style=style)
-                text.append(" " * self.SWATCH_GAP)
-            text.append("\n")
-
-            # Label line (padded to SWATCH_WIDTH so columns align with swatches)
-            text.append(Text(" " * self.INDENT, style="dim"))
-            for key in row_keys:
-                if self.display_mode == "base16":
-                    label = key
-                elif self.display_mode == "use":
-                    label = self.uses.get(key, key)
-                else:
-                    label = colors.get(key, "???")
-                text.append(Text(label.ljust(self.SWATCH_WIDTH), style="dim"))
-                text.append(Text(" " * self.SWATCH_GAP, style="dim"))
-            text.append("\n")
-
-        # Blank separator
+        if self.display_mode == "base16":
+            info = "  ".join(BASE16_KEYS)
+        elif self.display_mode == "use":
+            info = "  ".join(self.uses.get(k, k) for k in BASE16_KEYS)
+        else:
+            info = "  ".join(colors.get(k, "???") for k in BASE16_KEYS)
+        text.append(Text(f"  {info}\n", style="dim"))
         text.append("\n")
 
     # ── Reactive watchers ─────────────────────────────────────────
@@ -1666,7 +1618,7 @@ class PaletteApp(App):
                 rel_y = event.y - event.widget.gutter.top
             except Exception:
                 rel_y = event.y
-            card_idx = self.scroll_offset + rel_y // self._card_height()
+            card_idx = self.scroll_offset + rel_y // self.CARD_HEIGHT
             total = len(self._filtered_list())
             if 0 <= card_idx < total:
                 self.selected_index = card_idx
