@@ -800,8 +800,7 @@ class PaletteEditScreen(ModalScreen):
     PaletteEditScreen > #edit-dialog {
         width: 74;
         max-width: 92%;
-        height: auto;
-        max-height: 88%;
+        height: 90%;
         border: round $primary;
         padding: 1 2;
         background: $surface;
@@ -844,8 +843,8 @@ class PaletteEditScreen(ModalScreen):
         width: 22;
     }
     PaletteEditScreen #color-scroll {
-        height: 20;
-        max-height: 20;
+        height: 1fr;
+        max-height: 1fr;
         padding: 0 2;
     }
     PaletteEditScreen #preview-mock {
@@ -911,6 +910,15 @@ class PaletteEditScreen(ModalScreen):
 
     def on_mount(self) -> None:
         self._update_preview()
+
+    def on_focus(self, event) -> None:
+        """Scroll the color list to keep the focused input visible."""
+        if isinstance(event.widget, Input):
+            try:
+                scroll = self.query_one("#color-scroll", VerticalScroll)
+                scroll.scroll_to_widget(event.widget, animate=False)
+            except Exception:
+                pass
 
     def _focusable_inputs(self) -> list[Input]:
         """Return all Input widgets in tab order."""
@@ -1046,8 +1054,7 @@ class UsesEditScreen(ModalScreen):
     UsesEditScreen > #uses-dialog {
         width: 60;
         max-width: 92%;
-        height: auto;
-        max-height: 88%;
+        height: 90%;
         border: round $primary;
         padding: 1 2;
         background: $surface;
@@ -1077,8 +1084,8 @@ class UsesEditScreen(ModalScreen):
         width: 30;
     }
     UsesEditScreen #use-scroll {
-        height: 20;
-        max-height: 20;
+        height: 1fr;
+        max-height: 1fr;
         padding: 0 2;
     }
     UsesEditScreen .button-row {
@@ -1158,6 +1165,15 @@ class UsesEditScreen(ModalScreen):
                 inputs[(i - 1) % len(inputs)].focus()
                 return
         inputs[-1].focus()
+
+    def on_focus(self, event) -> None:
+        """Scroll the use-name list to keep the focused input visible."""
+        if isinstance(event.widget, Input):
+            try:
+                scroll = self.query_one("#use-scroll", VerticalScroll)
+                scroll.scroll_to_widget(event.widget, animate=False)
+            except Exception:
+                pass
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "save-btn":
