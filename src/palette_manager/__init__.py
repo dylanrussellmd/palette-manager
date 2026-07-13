@@ -38,7 +38,10 @@ List screen:
     n        New palette
     d        Delete palette
     u        Edit use-name mapping
+    v        Cycle display mode (hex → base16 → use-names)
     a        Activate + apply selected palette
+    /        Focus search bar
+    Esc      Clear search / unfocus
     q        Quit
 
 Edit screen:
@@ -689,12 +692,11 @@ class PaletteCard(Widget):
     .card-swatches {
         height: 3;
         padding: 0 1;
-        align: center middle;
     }
     .mini-swatch {
-        width: 8;
+        width: 7;
         height: 3;
-        margin: 0 1 0 0;
+        margin: 0 2 0 0;
     }
     .card-hex {
         color: $text-muted;
@@ -708,6 +710,8 @@ class PaletteCard(Widget):
         colors_data: dict,
         is_active: bool = False,
         is_readonly: bool = False,
+        display_mode: str = "hex",
+        uses: dict | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -715,6 +719,17 @@ class PaletteCard(Widget):
         self.colors_data = colors_data
         self.is_active = is_active
         self.is_readonly = is_readonly
+        self.display_mode = display_mode
+        self.uses = uses or {}
+
+    def _format_line(self) -> str:
+        """Format the color info line based on display_mode."""
+        if self.display_mode == "base16":
+            return "  ".join(k for k in BASE16_KEYS)
+        elif self.display_mode == "use":
+            return "  ".join(self.uses.get(k, k) for k in BASE16_KEYS)
+        else:  # hex
+            return "  ".join(self.colors_data.get(k, "???") for k in BASE16_KEYS)
 
     def compose(self) -> ComposeResult:
         marker = "  ★ active" if self.is_active else ""
@@ -724,8 +739,7 @@ class PaletteCard(Widget):
             for key in BASE16_KEYS:
                 hex_val = self.colors_data.get(key, "#000000")
                 yield ColorSwatch(hex_val, classes="mini-swatch")
-        hex_line = "  ".join(self.colors_data.get(k, "???") for k in BASE16_KEYS)
-        yield Label(hex_line, classes="card-hex")
+        yield Label(self._format_line(), classes="card-hex")
 
 
 # ── Palette edit screen ──────────────────────────────────────────
@@ -1051,6 +1065,38 @@ class UsesEditScreen(ModalScreen):
         self.dismiss(None)
 
 
+# ── Fuzzy search ──────────────────────────────────────────────────
+
+
+def fuzzy_match(query: str, text: str) -> bool:
+    """Return True if query fuzzy-matches text (subsequence match, case-insensitive).
+
+    Every character in query must appear in text in order, but not necessarily
+    contiguously. Empty query matches everything.
+    """
+    if not query:
+        return True
+    query = query.lower()
+    text = text.lower()
+    qi = 0
+    for ch in text:
+        if qi < len(query) and ch == query[qi]:
+            qi += 1
+    return qi == len(query)
+
+
+def palette_matches(query: str, name: str, colors: dict) -> bool:
+    """Check if a palette matches the search query by name or hex codes."""
+    if fuzzy_match(query, name):
+        return True
+    query_lower = query.lower()
+    for key in BASE16_KEYS:
+        hex_val = colors.get(key, "")
+        if query_lower in hex_val.lower():
+            return True
+    return False
+
+
 # ── Main app ─────────────────────────────────────────────────────
 
 
@@ -1065,6 +1111,14 @@ class PaletteApp(App):
         height: 1fr;
         padding: 1 2;
     }
+    #search-bar {
+        height: 3;
+        padding: 0 2;
+        dock: top;
+    }
+    #search-input {
+        width: 1fr;
+    }
     """
 
     BINDINGS = [
@@ -1077,12 +1131,20 @@ class PaletteApp(App):
         Binding("n", "new", "New"),
         Binding("d", "delete", "Delete"),
         Binding("u", "edit_uses", "Use-names"),
+        Binding("v", "cycle_display", "View"),
         Binding("a", "activate", "Activate"),
         Binding("q", "quit", "Quit"),
         Binding("ctrl+p", "noop", show=False),
+        Binding("/", "focus_search", "Search", show=False),
+        Binding("escape", "blur_search", show=False),
     ]
 
     selected_index = reactive(0)
+    display_mode = reactive("hex")
+    search_query = reactive("")
+
+    DISPLAY_MODES = ["hex", "base16", "use"]
+    DISPLAY_LABELS = {"hex": "hex", "base16": "base16", "use": "use-names"}
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -1097,19 +1159,21 @@ class PaletteApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        with Horizontal(id="search-bar"):
+            yield Input(
+                placeholder="Search palettes by name or hex code…  (/ to focus, Esc to clear)",
+                id="search-input",
+            )
         with VerticalScroll(id="palette-list"):
-            all_palettes = {}
-            all_palettes.update(self.palettes)
-            for name, colors in self.base16_schemes.items():
-                if name not in all_palettes:
-                    all_palettes[name] = colors
-            for i, (name, colors) in enumerate(all_palettes.items()):
+            for i, (name, colors) in enumerate(self._filtered_palettes().items()):
                 is_readonly = name in self.readonly
                 card = PaletteCard(
                     name,
                     colors,
                     is_active=(name == self.active_palette),
                     is_readonly=is_readonly,
+                    display_mode=self.display_mode,
+                    uses=self.uses,
                 )
                 if i == self.selected_index:
                     card.add_class("-selected")
@@ -1145,23 +1209,42 @@ class PaletteApp(App):
 
     # ── Rendering ─────────────────────────────────────────────────
 
-    def _refresh_cards(self) -> None:
-        """Full rebuild of the palette list."""
-        scroll = self.query_one("#palette-list", VerticalScroll)
-        scroll.remove_children()
-        # User palettes first, then base16 schemes (alphabetical)
+    def _all_palettes(self) -> dict:
+        """Merge user palettes + base16 schemes (user first)."""
         all_palettes = {}
         all_palettes.update(self.palettes)
         for name, colors in self.base16_schemes.items():
             if name not in all_palettes:
                 all_palettes[name] = colors
-        for i, (name, colors) in enumerate(all_palettes.items()):
+        return all_palettes
+
+    def _filtered_palettes(self) -> dict:
+        """Return palettes filtered by the current search query."""
+        all_palettes = self._all_palettes()
+        if not self.search_query:
+            return all_palettes
+        return {
+            name: colors
+            for name, colors in all_palettes.items()
+            if palette_matches(self.search_query, name, colors)
+        }
+
+    def _refresh_cards(self) -> None:
+        """Full rebuild of the palette list."""
+        scroll = self.query_one("#palette-list", VerticalScroll)
+        scroll.remove_children()
+        filtered = self._filtered_palettes()
+        if self.selected_index >= len(filtered):
+            self.selected_index = max(0, len(filtered) - 1)
+        for i, (name, colors) in enumerate(filtered.items()):
             is_readonly = name in self.readonly
             card = PaletteCard(
                 name,
                 colors,
                 is_active=(name == self.active_palette),
                 is_readonly=is_readonly,
+                display_mode=self.display_mode,
+                uses=self.uses,
             )
             if i == self.selected_index:
                 card.add_class("-selected")
@@ -1199,13 +1282,49 @@ class PaletteApp(App):
         max_idx = max(len(names) - 1, 0)
         self.selected_index = max(0, min(self.selected_index + delta, max_idx))
 
+    def action_focus_search(self) -> None:
+        """Focus the search input."""
+        try:
+            self.query_one("#search-input", Input).focus()
+        except Exception:
+            pass
+
+    def action_blur_search(self) -> None:
+        """Clear search and return focus to the list."""
+        try:
+            search_input = self.query_one("#search-input", Input)
+            if search_input.focused:
+                search_input.value = ""
+                self.search_query = ""
+                self.selected_index = 0
+                self._refresh_cards()
+                self.query_one("#palette-list", VerticalScroll).focus()
+            else:
+                # Esc in the main list — do nothing (let Textual handle it)
+                pass
+        except Exception:
+            pass
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Handle search input changes."""
+        if event.input.id == "search-input":
+            self.search_query = event.value.strip()
+            self.selected_index = 0
+            self._refresh_cards()
+
+    def action_cycle_display(self) -> None:
+        """Cycle through display modes: hex → base16 → use-names → hex."""
+        idx = self.DISPLAY_MODES.index(self.display_mode)
+        self.display_mode = self.DISPLAY_MODES[(idx + 1) % len(self.DISPLAY_MODES)]
+        self._refresh_cards()
+        self.notify(f"View: {self.DISPLAY_LABELS[self.display_mode]}", timeout=2)
+
+    def watch_display_mode(self, _mode: str) -> None:
+        """Refresh cards when display mode changes."""
+        pass  # refresh handled by action_cycle_display
+
     def _palette_names(self) -> list[str]:
-        all_palettes = {}
-        all_palettes.update(self.palettes)
-        for name, colors in self.base16_schemes.items():
-            if name not in all_palettes:
-                all_palettes[name] = colors
-        return list(all_palettes.keys())
+        return list(self._filtered_palettes().keys())
 
     def _get_palette_colors(self, name: str) -> dict:
         """Get colors for a palette name (user or base16)."""

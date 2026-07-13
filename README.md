@@ -167,7 +167,10 @@ palette-manager --config /path/to/config.yaml   # use a specific config
 | `n` | New palette |
 | `d` | Delete palette (user palettes only) |
 | `u` | Edit use-name mapping |
+| `v` | Cycle display mode (hex → base16 → use-names) |
 | `a` | Activate + apply |
+| `/` | Focus search bar |
+| `Esc` | Clear search / unfocus |
 | `q` | Quit |
 
 ### Edit screen
@@ -184,6 +187,27 @@ The edit screen shows all 16 colors with their base16 name and use-name (e.g. `b
 ### Use-name editor
 
 Press `u` from the list screen to rename use-name aliases. This lets you rebind which base16 slot a use-name points to — for example, pointing `accent` at `base0D` instead of `base07`. Changes are saved to `palettes.yaml` and applied on the next `palette-manager --apply`.
+
+### Search
+
+Press `/` to focus the search bar at the top of the list. Search is fuzzy and matches both palette names and hex color values:
+
+- **Name search:** typing `cat` matches "Catppuccin Mocha" (subsequence match, case-insensitive)
+- **Hex search:** typing `f38ba8` matches any palette containing that color value
+- Press `Esc` to clear the search and return to the full list
+- Navigation keys (`j`/`k`, `↑`/`↓`) work while searching
+
+### Display modes
+
+Press `v` to cycle how color information is displayed on each palette card:
+
+| Mode | Shows | Example |
+|---|---|---|
+| `hex` | Hex color values | `#11111b  #1e1e2e  #313244 …` |
+| `base16` | base16 slot names | `base00  base01  base02 …` |
+| `use-names` | Use-name aliases | `bg  surface  selection …` |
+
+The swatch colors are always visible regardless of display mode.
 
 ### Autofill
 
