@@ -1,5 +1,16 @@
 """TUI for managing color palettes with configurable apply behavior.
 
+Palettes use a 16-color base16 system. Each color has TWO names:
+
+  - a base16 name (base00–base0F) — the canonical storage key
+  - a use-name (bg, surface, text, accent, etc.) — a customizable alias
+    defined by the `uses` mapping in palettes.yaml
+
+On apply, palette-manager writes BOTH the base16 keys and the use-name
+aliases to the theme file, so downstream tools can read whichever they
+prefer. Users can remap use-names (e.g. point "accent" at base0D instead
+of base07) by editing the `uses` block in palettes.yaml.
+
 By default, palettes are stored in ~/.config/palette-manager/palettes.yaml.
 Configure theme file output and apply commands via a config file:
 
@@ -11,7 +22,6 @@ Config file format (YAML):
     palettes_file: ~/.config/palette-manager/palettes.yaml
     theme_file: null               # where to write active palette's colors
     theme_path: null               # dotted path within the file (e.g. "theme.colors")
-    theme_keys: [bg, surface, text, accent, urgent, border, shadow]
     apply_command: null            # shell command to run after writing
 
 Usage:
@@ -19,30 +29,52 @@ Usage:
     palette-manager --check      List palettes and exit
     palette-manager --apply      Apply active palette (non-interactive)
     palette-manager --init       Create default config file
+    palette-manager --update-base16  Force-update base16 scheme cache
     palette-manager --config /path/to/config.yaml   Use a specific config
 
 List screen:
     ↑/↓      Navigate palettes
-    Enter/e  Edit selected palette
+    e/Enter  Edit (or duplicate if built-in)
     n        New palette
     d        Delete palette
+    u        Edit use-name mapping
     a        Activate + apply selected palette
     q        Quit
 
 Edit screen:
     Tab      Move between fields
+    Ctrl+A   Autofill from base00 + base05 + base07
     [Save]   Button or Ctrl+S
     Esc      Cancel
+
+Autofill:
+    Given 3 seed colors (base00/bg, base05/text, base07/accent),
+    derives the remaining 13 colors using color theory:
+      - Structural colors (base01–base04, base06) are interpolated
+        along a perceptually uniform lightness ramp (HSLuv) between
+        bg and text, sharing bg's hue and saturation.
+      - Semantic colors (base08–base0F) use 8 canonical hues with
+        the accent's chroma and lightness, clamped to readable ranges.
+    Enter the 3 seeds, press Ctrl+A or click Autofill, then adjust.
+
+Built-in base16 schemes (🔒) are downloaded from tinted-theming/schemes
+and cached for 24h. They cannot be edited or deleted, but pressing 'e'
+on one duplicates it as a user palette for editing.
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import subprocess
 import sys
+import tarfile
+import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 
+from hsluv import hex_to_hsluv, hsluv_to_hex
 from ruamel.yaml import YAML
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -55,62 +87,174 @@ from textual.widgets import Button, Footer, Header, Input, Label, Static
 
 # ── Constants ────────────────────────────────────────────────────
 
-COLOR_KEYS = ["bg", "surface", "text", "accent", "urgent", "border", "shadow"]
+BASE16_KEYS = [
+    "base00",
+    "base01",
+    "base02",
+    "base03",
+    "base04",
+    "base05",
+    "base06",
+    "base07",
+    "base08",
+    "base09",
+    "base0A",
+    "base0B",
+    "base0C",
+    "base0D",
+    "base0E",
+    "base0F",
+]
+
+DEFAULT_USES = {
+    "base00": "bg",
+    "base01": "surface",
+    "base02": "selection",
+    "base03": "muted",
+    "base04": "border",
+    "base05": "text",
+    "base06": "shadow",
+    "base07": "accent",
+    "base08": "red",
+    "base09": "orange",
+    "base0A": "yellow",
+    "base0B": "green",
+    "base0C": "cyan",
+    "base0D": "blue",
+    "base0E": "magenta",
+    "base0F": "urgent",
+}
+
+# base16 schemes cache
+BASE16_REPO_URL = (
+    "https://github.com/tinted-theming/schemes/archive/refs/heads/spec-0.11.tar.gz"
+)
+BASE16_CACHE_TTL = timedelta(hours=24)  # re-download if older than this
+
+# Backward-compat alias (some code references COLOR_KEYS).
+COLOR_KEYS = BASE16_KEYS
+
+# Canonical hues (in HSLuv degrees) for the 8 semantic colors.
+# Slightly shifted from pure ANSI values for a more refined look.
+CANONICAL_HUES = {
+    "base08": 0,  # red
+    "base09": 30,  # orange
+    "base0A": 55,  # yellow (warm, not pure 60°)
+    "base0B": 135,  # green (teal-leaning, not pure 120°)
+    "base0C": 185,  # cyan
+    "base0D": 225,  # blue (purple-leaning, not pure 240°)
+    "base0E": 300,  # magenta
+    "base0F": 350,  # urgent (pink-red, not pure 0°)
+}
 
 SEED_PALETTES = {
     "Default": {
-        "bg": "#11111b",
-        "surface": "#1e1e2e",
-        "text": "#cdd6f4",
-        "accent": "#4DFFBC",
-        "urgent": "#FF4D4D",
-        "border": "#898989",
-        "shadow": "#898989",
+        "base00": "#11111b",
+        "base01": "#1e1e2e",
+        "base02": "#313244",
+        "base03": "#6c7086",
+        "base04": "#898989",
+        "base05": "#cdd6f4",
+        "base06": "#898989",
+        "base07": "#4DFFBC",
+        "base08": "#FF4D4D",
+        "base09": "#FFA94D",
+        "base0A": "#FFD75F",
+        "base0B": "#4DFFBC",
+        "base0C": "#7DCFFF",
+        "base0D": "#7aa2f7",
+        "base0E": "#BB9AF7",
+        "base0F": "#FF4D4D",
     },
     "Catppuccin Mocha": {
-        "bg": "#1e1e2e",
-        "surface": "#313244",
-        "text": "#cdd6f4",
-        "accent": "#89b4fa",
-        "urgent": "#f38ba8",
-        "border": "#45475a",
-        "shadow": "#11111bc0",
+        "base00": "#1e1e2e",
+        "base01": "#313244",
+        "base02": "#45475a",
+        "base03": "#6c7086",
+        "base04": "#45475a",
+        "base05": "#cdd6f4",
+        "base06": "#11111bc0",
+        "base07": "#89b4fa",
+        "base08": "#f38ba8",
+        "base09": "#fab387",
+        "base0A": "#f9e2af",
+        "base0B": "#a6e3a1",
+        "base0C": "#94e2d5",
+        "base0D": "#89b4fa",
+        "base0E": "#cba6f7",
+        "base0F": "#f38ba8",
     },
     "Tokyo Night": {
-        "bg": "#1a1b26",
-        "surface": "#24283b",
-        "text": "#c0caf5",
-        "accent": "#7aa2f7",
-        "urgent": "#f7768e",
-        "border": "#414868",
-        "shadow": "#000000a0",
+        "base00": "#1a1b26",
+        "base01": "#24283b",
+        "base02": "#283457",
+        "base03": "#565f89",
+        "base04": "#414868",
+        "base05": "#c0caf5",
+        "base06": "#000000a0",
+        "base07": "#7aa2f7",
+        "base08": "#f7768e",
+        "base09": "#ff9e64",
+        "base0A": "#e0af68",
+        "base0B": "#9ece6a",
+        "base0C": "#7dcfff",
+        "base0D": "#7aa2f7",
+        "base0E": "#bb9af7",
+        "base0F": "#f7768e",
     },
     "Gruvbox Dark": {
-        "bg": "#282828",
-        "surface": "#3c3836",
-        "text": "#ebdbb2",
-        "accent": "#b8bb26",
-        "urgent": "#fb4934",
-        "border": "#504945",
-        "shadow": "#000000a0",
+        "base00": "#282828",
+        "base01": "#3c3836",
+        "base02": "#504945",
+        "base03": "#7c6f64",
+        "base04": "#504945",
+        "base05": "#ebdbb2",
+        "base06": "#000000a0",
+        "base07": "#b8bb26",
+        "base08": "#fb4934",
+        "base09": "#fe8019",
+        "base0A": "#fabd2f",
+        "base0B": "#b8bb26",
+        "base0C": "#8ec07c",
+        "base0D": "#83a598",
+        "base0E": "#d3869b",
+        "base0F": "#fb4934",
     },
     "Nord": {
-        "bg": "#2e3440",
-        "surface": "#3b4252",
-        "text": "#d8dee9",
-        "accent": "#88c0d0",
-        "urgent": "#bf616a",
-        "border": "#4c566a",
-        "shadow": "#000000a0",
+        "base00": "#2e3440",
+        "base01": "#3b4252",
+        "base02": "#434c5e",
+        "base03": "#4c566a",
+        "base04": "#4c566a",
+        "base05": "#d8dee9",
+        "base06": "#000000a0",
+        "base07": "#88c0d0",
+        "base08": "#bf616a",
+        "base09": "#d08770",
+        "base0A": "#ebcb8b",
+        "base0B": "#a3be8c",
+        "base0C": "#88c0d0",
+        "base0D": "#81a1c1",
+        "base0E": "#b48ead",
+        "base0F": "#bf616a",
     },
     "Rose Pine": {
-        "bg": "#191724",
-        "surface": "#1f1d2e",
-        "text": "#e0def4",
-        "accent": "#ebbcba",
-        "urgent": "#eb6f92",
-        "border": "#26233a",
-        "shadow": "#000000a0",
+        "base00": "#191724",
+        "base01": "#1f1d2e",
+        "base02": "#26233a",
+        "base03": "#6e6a86",
+        "base04": "#26233a",
+        "base05": "#e0def4",
+        "base06": "#000000a0",
+        "base07": "#ebbcba",
+        "base08": "#eb6f92",
+        "base09": "#f6c177",
+        "base0A": "#f6c177",
+        "base0B": "#9ccfd8",
+        "base0C": "#9ccfd8",
+        "base0D": "#31748f",
+        "base0E": "#c4a7e7",
+        "base0F": "#eb6f92",
     },
 }
 
@@ -129,8 +273,12 @@ class Config:
     palettes_file: Path = DEFAULT_PALETTES_FILE
     theme_file: Path | None = None
     theme_path: str | None = None
-    theme_keys: list[str] = field(default_factory=lambda: list(COLOR_KEYS))
     apply_command: str | None = None
+
+    @property
+    def base16_schemes_file(self) -> Path:
+        """Cache file for downloaded base16 schemes, alongside palettes_file."""
+        return self.palettes_file.parent / "base16-schemes.yaml"
 
 
 def load_config(config_path: Path | None = None) -> Config:
@@ -155,7 +303,6 @@ def load_config(config_path: Path | None = None) -> Config:
         palettes_file=resolve(data.get("palettes_file")) or DEFAULT_PALETTES_FILE,
         theme_file=resolve(data.get("theme_file")),
         theme_path=data.get("theme_path"),
-        theme_keys=data.get("theme_keys") or list(COLOR_KEYS),
         apply_command=data.get("apply_command"),
     )
 
@@ -185,15 +332,9 @@ theme_file: null
 # Leave null to write at the root level.
 theme_path: null
 
-# Color keys to write to the theme file.
-theme_keys:
-  - bg
-  - surface
-  - text
-  - accent
-  - urgent
-  - border
-  - shadow
+# palette-manager writes all 16 base16 keys (base00–base0F) plus
+# their use-name aliases (bg, surface, text, etc.) from the `uses`
+# mapping in palettes.yaml. No need to list keys here.
 
 # Shell command to run after writing colors on apply.
 # Examples:
@@ -208,38 +349,239 @@ apply_command: null
     return 0
 
 
+# ── Color helpers ─────────────────────────────────────────────────
+
+
+def _hex_to_hsluv(hex_str: str) -> tuple[float, float, float]:
+    """Convert #rrggbb or #rrggbbaa to (h, s, l) in HSLuv space."""
+    h = hex_str.lstrip("#")
+    if len(h) == 8:
+        h = h[:6]  # strip alpha
+    return hex_to_hsluv(f"#{h}")
+
+
+def _hsluv_to_hex(h: float, s: float, l: float) -> str:
+    """Convert (h, s, l) in HSLuv to #rrggbb."""
+    return hsluv_to_hex((h, s, l))
+
+
+# ── Autofill ──────────────────────────────────────────────────────
+
+
+def autofill_colors(colors: dict) -> dict:
+    """Derive all 16 colors from 3 seed colors.
+
+    Requires:
+      - base00 (bg): darkest background color
+      - base05 (text): lightest foreground color
+      - base07 (accent): the palette's accent / highlight color
+
+    Derives:
+      - base01–base04: lightness ramp between bg and text (bg's hue/saturation)
+      - base06: shadow (darker than bg, same hue)
+      - base08–base0F: semantic colors at canonical hues, using accent's
+        chroma/lightness clamped to readable ranges
+    """
+    bg = colors.get("base00")
+    text = colors.get("base05")
+    accent = colors.get("base07")
+
+    if not all([bg, text, accent]):
+        raise ValueError(
+            "Autofill requires base00 (bg), base05 (text), and base07 (accent)"
+        )
+
+    result = dict(colors)
+
+    bg_h, bg_s, bg_l = _hex_to_hsluv(bg)
+    text_h, text_s, text_l = _hex_to_hsluv(text)
+    _, accent_s, accent_l = _hex_to_hsluv(accent)
+
+    # Structural ramp: base01–base04 interpolated between bg and text.
+    # Uses bg's hue and saturation for a cohesive structural palette.
+    ramp_keys = ["base01", "base02", "base03", "base04"]
+    n_steps = len(ramp_keys) + 1  # 5 intervals between bg and text
+    for i, key in enumerate(ramp_keys, 1):
+        t = i / n_steps
+        l = bg_l + (text_l - bg_l) * t
+        result[key] = _hsluv_to_hex(bg_h, bg_s, l)
+
+    # Shadow: darker than bg, same hue
+    result["base06"] = _hsluv_to_hex(bg_h, bg_s, max(bg_l * 0.35, 5))
+
+    # Semantic colors: canonical hues with accent's chroma/lightness,
+    # clamped to ensure readability across all hues.
+    target_s = max(50, min(90, accent_s))
+    target_l = max(55, min(80, accent_l))
+
+    for key, hue in CANONICAL_HUES.items():
+        result[key] = _hsluv_to_hex(hue, target_s, target_l)
+
+    return result
+
+
+# ── Base16 scheme cache ──────────────────────────────────────────
+
+
+def _needs_update(cache_file: Path) -> bool:
+    """Check if the base16 cache is missing or stale."""
+    if not cache_file.exists():
+        return True
+    try:
+        yaml = YAML()
+        with open(cache_file) as f:
+            doc = yaml.load(f)
+        if doc is None:
+            return True
+        last_updated_str = doc.get("last_updated")
+        if not last_updated_str:
+            return True
+        last_updated = datetime.fromisoformat(last_updated_str)
+        return datetime.now() - last_updated > BASE16_CACHE_TTL
+    except Exception:
+        return True
+
+
+def _download_base16_schemes() -> dict:
+    """Download and parse all base16 schemes from the tinted-theming repo.
+
+    Returns a dict: { "Scheme Name": { "base00": "#hex", ... }, ... }
+    Raises on network failure.
+    """
+    response = urllib.request.urlopen(BASE16_REPO_URL, timeout=15)
+    tar_bytes = response.read()
+
+    schemes: dict[str, dict[str, str]] = {}
+    yaml = YAML()
+
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
+        for member in tar.getmembers():
+            if not ("/base16/" in member.name and member.name.endswith(".yaml")):
+                continue
+            if member.size == 0:
+                continue
+            f = tar.extractfile(member)
+            if f is None:
+                continue
+            content = f.read().decode("utf-8")
+            try:
+                data = yaml.load(content)
+            except Exception:
+                continue
+            if data is None:
+                continue
+            # The tinted-theming spec uses `name` for the scheme name and
+            # nests colors under `palette`. Fall back to `scheme` and flat
+            # keys for compatibility with older/different formats.
+            name = data.get("name") or data.get("scheme")
+            if not name:
+                continue
+            palette = data.get("palette")
+            if not isinstance(palette, dict):
+                palette = data  # flat format
+            colors: dict[str, str] = {}
+            for key in BASE16_KEYS:
+                hex_val = palette.get(key, "000000")
+                if isinstance(hex_val, str):
+                    hex_val = hex_val.lstrip("#")
+                    colors[key] = f"#{hex_val}"
+                else:
+                    colors[key] = "#000000"
+            schemes[str(name)] = colors
+
+    return schemes
+
+
+def update_base16_cache(config: Config, force: bool = False) -> tuple[bool, int, str]:
+    """Download base16 schemes if cache is stale or missing.
+
+    Returns (updated, count, message). If network fails, returns (False, 0, error_msg).
+    """
+    cache_file = config.base16_schemes_file
+
+    if not force and not _needs_update(cache_file):
+        # Cache is fresh — load and return count
+        schemes = _load_base16_cache(cache_file)
+        return False, len(schemes), ""
+
+    try:
+        schemes = _download_base16_schemes()
+    except Exception as e:
+        return False, 0, str(e)
+
+    # Save cache
+    data = {
+        "last_updated": datetime.now().isoformat(),
+        "schemes": schemes,
+    }
+    _dump_yaml(cache_file, data)
+    return True, len(schemes), ""
+
+
+def _load_base16_cache(cache_file: Path) -> dict:
+    """Load base16 schemes from cache file. Returns empty dict if missing."""
+    if not cache_file.exists():
+        return {}
+    try:
+        yaml = YAML()
+        with open(cache_file) as f:
+            doc = yaml.load(f)
+        if doc is None:
+            return {}
+        return dict(doc.get("schemes", {}))
+    except Exception:
+        return {}
+
+
+def load_base16_schemes(config: Config) -> dict:
+    """Load base16 schemes from cache (without downloading)."""
+    return _load_base16_cache(config.base16_schemes_file)
+
+
 # ── YAML helpers ──────────────────────────────────────────────────
 
 
-def load_palettes(config: Config) -> tuple[dict, str]:
+def load_palettes(config: Config) -> tuple[dict, str, dict, dict]:
     """Load palettes.yaml. Seeds with defaults if missing."""
     yaml = YAML()
     if not config.palettes_file.exists():
         config.palettes_file.parent.mkdir(parents=True, exist_ok=True)
-        data = {"active": "Default", "palettes": SEED_PALETTES}
+        data = {"active": "Default", "uses": DEFAULT_USES, "palettes": SEED_PALETTES}
         _dump_yaml(config.palettes_file, data)
-        return dict(SEED_PALETTES), "Default"
+        return (
+            dict(SEED_PALETTES),
+            "Default",
+            dict(DEFAULT_USES),
+            load_base16_schemes(config),
+        )
 
     with open(config.palettes_file) as f:
         doc = yaml.load(f)
     palettes = dict(doc.get("palettes", {}))
     active = doc.get("active", "")
+    uses = (
+        dict(doc.get("uses", DEFAULT_USES)) if doc.get("uses") else dict(DEFAULT_USES)
+    )
     if not palettes:
         palettes = dict(SEED_PALETTES)
         active = "Default"
     if active not in palettes:
         active = next(iter(palettes))
-    return palettes, active
+
+    # Load base16 schemes from cache (download happens separately in on_mount)
+    base16 = load_base16_schemes(config)
+
+    return palettes, active, uses, base16
 
 
-def save_palettes(palettes: dict, active: str, config: Config) -> None:
-    """Write palettes + active name to palettes.yaml."""
-    data = {"active": active, "palettes": palettes}
+def save_palettes(palettes: dict, active: str, uses: dict, config: Config) -> None:
+    """Write palettes + active name + uses mapping to palettes.yaml."""
+    data = {"active": active, "uses": uses, "palettes": palettes}
     _dump_yaml(config.palettes_file, data)
 
 
-def write_theme_colors(colors: dict, config: Config) -> None:
-    """Write active palette's colors into theme file, preserving comments."""
+def write_theme_colors(colors: dict, config: Config, uses: dict) -> None:
+    """Write active palette's colors into theme file as both base16 names and use-name aliases."""
     if config.theme_file is None:
         return
 
@@ -258,8 +600,14 @@ def write_theme_colors(colors: dict, config: Config) -> None:
                 target[part] = {}
             target = target[part]
 
-    for key in config.theme_keys:
-        target[key] = colors[key]
+    # Write base16 keys
+    for key in BASE16_KEYS:
+        target[key] = colors.get(key, "#000000")
+
+    # Write use-name aliases (same hex values, different keys)
+    for base16_key, use_name in uses.items():
+        if base16_key in colors:
+            target[use_name] = colors[base16_key]
 
     config.theme_file.parent.mkdir(parents=True, exist_ok=True)
     with open(config.theme_file, "w") as f:
@@ -331,6 +679,9 @@ class PaletteCard(Widget):
     PaletteCard.-selected {
         border: round $accent;
     }
+    PaletteCard.-readonly .card-name {
+        color: $text-muted;
+    }
     .card-name {
         text-style: bold;
         padding: 0 1;
@@ -352,21 +703,28 @@ class PaletteCard(Widget):
     """
 
     def __init__(
-        self, name: str, colors_data: dict, is_active: bool = False, **kwargs
+        self,
+        name: str,
+        colors_data: dict,
+        is_active: bool = False,
+        is_readonly: bool = False,
+        **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.palette_name = name
         self.colors_data = colors_data
         self.is_active = is_active
+        self.is_readonly = is_readonly
 
     def compose(self) -> ComposeResult:
         marker = "  ★ active" if self.is_active else ""
-        yield Label(f"{self.palette_name}{marker}", classes="card-name")
+        lock = "  🔒" if self.is_readonly else ""
+        yield Label(f"{self.palette_name}{marker}{lock}", classes="card-name")
         with Horizontal(classes="card-swatches"):
-            for key in COLOR_KEYS:
+            for key in BASE16_KEYS:
                 hex_val = self.colors_data.get(key, "#000000")
                 yield ColorSwatch(hex_val, classes="mini-swatch")
-        hex_line = "  ".join(self.colors_data.get(k, "???") for k in COLOR_KEYS)
+        hex_line = "  ".join(self.colors_data.get(k, "???") for k in BASE16_KEYS)
         yield Label(hex_line, classes="card-hex")
 
 
@@ -415,7 +773,7 @@ class PaletteEditScreen(ModalScreen):
         align: center middle;
     }
     PaletteEditScreen .color-label {
-        width: 14;
+        width: 20;
         content-align: right middle;
     }
     PaletteEditScreen .swatch {
@@ -425,6 +783,11 @@ class PaletteEditScreen(ModalScreen):
     }
     PaletteEditScreen .hex-input {
         width: 22;
+    }
+    PaletteEditScreen #color-scroll {
+        height: 20;
+        max-height: 20;
+        padding: 0 2;
     }
     PaletteEditScreen #preview-mock {
         height: 5;
@@ -443,13 +806,17 @@ class PaletteEditScreen(ModalScreen):
 
     BINDINGS = [
         Binding("ctrl+s", "save", "Save"),
+        Binding("ctrl+a", "autofill", "Autofill"),
         Binding("escape", "cancel", "Cancel"),
     ]
 
-    def __init__(self, name: str, colors: dict, is_new: bool = False) -> None:
+    def __init__(
+        self, name: str, colors: dict, uses: dict, is_new: bool = False
+    ) -> None:
         super().__init__()
         self.original_name = name
         self.colors = dict(colors)
+        self.uses = dict(uses)
         self.is_new = is_new
 
     def compose(self) -> ComposeResult:
@@ -462,15 +829,20 @@ class PaletteEditScreen(ModalScreen):
                     value=self.original_name, id="palette-name", classes="name-input"
                 )
             yield Label(" COLORS", classes="section-label")
-            for key in COLOR_KEYS:
-                hex_val = self.colors.get(key, "#000000")
-                with Horizontal(classes="color-row"):
-                    yield Label(key, classes="color-label")
-                    yield ColorSwatch(hex_val, id=f"swatch-{key}", classes="swatch")
-                    yield Input(value=hex_val, id=f"color-{key}", classes="hex-input")
+            with VerticalScroll(id="color-scroll"):
+                for key in BASE16_KEYS:
+                    hex_val = self.colors.get(key, "#000000")
+                    use_name = self.uses.get(key, key) if hasattr(self, "uses") else key
+                    with Horizontal(classes="color-row"):
+                        yield Label(f"{key} / {use_name}", classes="color-label")
+                        yield ColorSwatch(hex_val, id=f"swatch-{key}", classes="swatch")
+                        yield Input(
+                            value=hex_val, id=f"color-{key}", classes="hex-input"
+                        )
             yield Label(" PREVIEW", classes="section-label")
             yield Static(id="preview-mock")
             with Horizontal(classes="button-row"):
+                yield Button("Autofill", id="autofill-btn", variant="primary")
                 yield Button("Save", id="save-btn", variant="success")
                 yield Button("Cancel", id="cancel-btn", variant="error")
 
@@ -494,24 +866,54 @@ class PaletteEditScreen(ModalScreen):
             self.action_save()
         elif event.button.id == "cancel-btn":
             self.action_cancel()
+        elif event.button.id == "autofill-btn":
+            self.action_autofill()
+
+    def action_autofill(self) -> None:
+        """Derive missing colors from seed colors (base00, base05, base07)."""
+        colors = self._collect_colors()
+        try:
+            filled = autofill_colors(colors)
+        except ValueError as e:
+            self.notify(str(e), severity="error", timeout=4)
+            return
+
+        # Update all input fields and swatches with derived values
+        for key in BASE16_KEYS:
+            try:
+                input_widget = self.query_one(f"#color-{key}", Input)
+                input_widget.value = filled[key]
+            except Exception:
+                pass
+            try:
+                self.query_one(f"#swatch-{key}", ColorSwatch).hex_color = filled[key]
+            except Exception:
+                pass
+
+        self._update_preview()
+        self.notify("Autofilled from base00 + base05 + base07", timeout=3)
 
     def _update_preview(self) -> None:
         colors = self._collect_colors()
+        uses_rev = {v: k for k, v in self.uses.items()}
         try:
             mock = self.query_one("#preview-mock", Static)
-            bg = colors.get("bg", "#000000")
+            bg = colors.get(uses_rev.get("bg", "base00"), "#000000")
+            text = colors.get(uses_rev.get("text", "base05"), "#fff")
+            accent = colors.get(uses_rev.get("accent", "base07"), "#0f0")
+            urgent = colors.get(uses_rev.get("urgent", "base0F"), "#f00")
             mock.styles.background = Color.parse(bg)
             mock.update(
-                f"[{colors.get('text', '#fff')}]Main System Dashboard[/]\n"
-                f"[{colors.get('accent', '#0f0')}]CPU: 14% | RAM: 4.2GB[/]\n"
-                f"[{colors.get('urgent', '#f00')}]! Low battery[/]"
+                f"[{text}]Main System Dashboard[/]\n"
+                f"[{accent}]CPU: 14% | RAM: 4.2GB[/]\n"
+                f"[{urgent}]! Low battery[/]"
             )
         except Exception:
             pass
 
     def _collect_colors(self) -> dict:
         colors: dict[str, str] = {}
-        for key in COLOR_KEYS:
+        for key in BASE16_KEYS:
             try:
                 colors[key] = self.query_one(
                     f"#color-{key}", Input
@@ -531,6 +933,119 @@ class PaletteEditScreen(ModalScreen):
 
     def action_save(self) -> None:
         self.dismiss((self._get_name(), self._collect_colors()))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class UsesEditScreen(ModalScreen):
+    """Modal screen for editing the base16 → use-name mapping."""
+
+    DEFAULT_CSS = """
+    UsesEditScreen {
+        align: center middle;
+    }
+    UsesEditScreen > #uses-dialog {
+        width: 60;
+        max-width: 92%;
+        height: auto;
+        max-height: 88%;
+        border: round $primary;
+        padding: 1 2;
+        background: $surface;
+    }
+    UsesEditScreen .section-label {
+        background: $primary;
+        text-style: bold;
+        padding: 0 1;
+        margin: 1 0 0 0;
+    }
+    UsesEditScreen .use-row {
+        height: 3;
+        layout: horizontal;
+        padding: 0 2;
+        align: center middle;
+    }
+    UsesEditScreen .base16-label {
+        width: 12;
+        content-align: right middle;
+    }
+    UsesEditScreen .arrow {
+        width: 3;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    UsesEditScreen .use-input {
+        width: 30;
+    }
+    UsesEditScreen #use-scroll {
+        height: 20;
+        max-height: 20;
+        padding: 0 2;
+    }
+    UsesEditScreen .button-row {
+        height: 3;
+        padding: 1 2 0 2;
+        align: center middle;
+    }
+    UsesEditScreen .button-row Button {
+        margin: 0 1;
+    }
+    UsesEditScreen .help-text {
+        color: $text-muted;
+        padding: 0 2;
+        height: 3;
+    }
+    """
+
+    BINDINGS = [
+        Binding("ctrl+s", "save", "Save"),
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, uses: dict) -> None:
+        super().__init__()
+        self.uses = dict(uses)
+
+    def compose(self) -> ComposeResult:
+        with Container(id="uses-dialog"):
+            yield Label(" EDIT USE-NAMES", classes="section-label")
+            yield Label(
+                " Rename use-name aliases. base16 keys never change.",
+                classes="help-text",
+            )
+            with VerticalScroll(id="use-scroll"):
+                for key in BASE16_KEYS:
+                    use_name = self.uses.get(key, key)
+                    with Horizontal(classes="use-row"):
+                        yield Label(key, classes="base16-label")
+                        yield Label("→", classes="arrow")
+                        yield Input(
+                            value=use_name, id=f"use-{key}", classes="use-input"
+                        )
+            with Horizontal(classes="button-row"):
+                yield Button("Save", id="save-btn", variant="success")
+                yield Button("Cancel", id="cancel-btn", variant="error")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "save-btn":
+            self.action_save()
+        elif event.button.id == "cancel-btn":
+            self.action_cancel()
+
+    def _collect_uses(self) -> dict:
+        uses: dict[str, str] = {}
+        for key in BASE16_KEYS:
+            try:
+                uses[key] = self.query_one(
+                    f"#use-{key}", Input
+                ).value.strip() or self.uses.get(key, key)
+            except Exception:
+                uses[key] = self.uses.get(key, key)
+        return uses
+
+    def action_save(self) -> None:
+        self.dismiss(self._collect_uses())
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -561,6 +1076,7 @@ class PaletteApp(App):
         Binding("e", "edit", "Edit"),
         Binding("n", "new", "New"),
         Binding("d", "delete", "Delete"),
+        Binding("u", "edit_uses", "Use-names"),
         Binding("a", "activate", "Activate"),
         Binding("q", "quit", "Quit"),
         Binding("ctrl+p", "noop", show=False),
@@ -571,7 +1087,10 @@ class PaletteApp(App):
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.config = config
-        self.palettes, self.active_palette = load_palettes(config)
+        self.palettes, self.active_palette, self.uses, self.base16_schemes = (
+            load_palettes(config)
+        )
+        self.readonly = set(self.base16_schemes.keys())
         self.SUB_TITLE = str(config.palettes_file)
 
     # ── Compose ───────────────────────────────────────────────────
@@ -579,11 +1098,18 @@ class PaletteApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with VerticalScroll(id="palette-list"):
-            for i, (name, colors) in enumerate(self.palettes.items()):
+            all_palettes = {}
+            all_palettes.update(self.palettes)
+            for name, colors in self.base16_schemes.items():
+                if name not in all_palettes:
+                    all_palettes[name] = colors
+            for i, (name, colors) in enumerate(all_palettes.items()):
+                is_readonly = name in self.readonly
                 card = PaletteCard(
                     name,
                     colors,
                     is_active=(name == self.active_palette),
+                    is_readonly=is_readonly,
                 )
                 if i == self.selected_index:
                     card.add_class("-selected")
@@ -594,6 +1120,28 @@ class PaletteApp(App):
         scroll = self.query_one("#palette-list", VerticalScroll)
         scroll.can_focus = False
         self._refresh_cards()
+        # Check for base16 scheme updates in the background
+        self._update_base16_schemes()
+
+    def _update_base16_schemes(self) -> None:
+        """Download base16 schemes if cache is stale."""
+        import threading
+
+        def do_update():
+            updated, count, err = update_base16_cache(self.config)
+            if updated and count > 0:
+                self.base16_schemes = load_base16_schemes(self.config)
+                self.readonly = set(self.base16_schemes.keys())
+                self.call_from_thread(self._on_base16_updated, count)
+            elif err and not self.base16_schemes:
+                pass  # silent failure, no cache
+
+        thread = threading.Thread(target=do_update, daemon=True)
+        thread.start()
+
+    def _on_base16_updated(self, count: int) -> None:
+        self._refresh_cards()
+        self.notify(f"Updated {count} base16 schemes", timeout=3)
 
     # ── Rendering ─────────────────────────────────────────────────
 
@@ -601,11 +1149,19 @@ class PaletteApp(App):
         """Full rebuild of the palette list."""
         scroll = self.query_one("#palette-list", VerticalScroll)
         scroll.remove_children()
-        for i, (name, colors) in enumerate(self.palettes.items()):
+        # User palettes first, then base16 schemes (alphabetical)
+        all_palettes = {}
+        all_palettes.update(self.palettes)
+        for name, colors in self.base16_schemes.items():
+            if name not in all_palettes:
+                all_palettes[name] = colors
+        for i, (name, colors) in enumerate(all_palettes.items()):
+            is_readonly = name in self.readonly
             card = PaletteCard(
                 name,
                 colors,
                 is_active=(name == self.active_palette),
+                is_readonly=is_readonly,
             )
             if i == self.selected_index:
                 card.add_class("-selected")
@@ -639,11 +1195,25 @@ class PaletteApp(App):
     # ── Actions ───────────────────────────────────────────────────
 
     def action_navigate(self, delta: int) -> None:
-        max_idx = max(len(self.palettes) - 1, 0)
+        names = self._palette_names()
+        max_idx = max(len(names) - 1, 0)
         self.selected_index = max(0, min(self.selected_index + delta, max_idx))
 
     def _palette_names(self) -> list[str]:
-        return list(self.palettes.keys())
+        all_palettes = {}
+        all_palettes.update(self.palettes)
+        for name, colors in self.base16_schemes.items():
+            if name not in all_palettes:
+                all_palettes[name] = colors
+        return list(all_palettes.keys())
+
+    def _get_palette_colors(self, name: str) -> dict:
+        """Get colors for a palette name (user or base16)."""
+        if name in self.palettes:
+            return self.palettes[name]
+        if name in self.base16_schemes:
+            return self.base16_schemes[name]
+        return {}
 
     def _selected_name(self) -> str | None:
         names = self._palette_names()
@@ -657,6 +1227,12 @@ class PaletteApp(App):
         if name is None:
             return
 
+        # If read-only (base16), duplicate first
+        if name in self.readonly:
+            self._duplicate_palette(name)
+            return
+
+        # Normal edit flow for user palettes
         def on_result(result):
             if result is None:
                 return
@@ -666,12 +1242,40 @@ class PaletteApp(App):
                 if self.active_palette == name:
                     self.active_palette = new_name
             self.palettes[new_name] = new_colors
-            save_palettes(self.palettes, self.active_palette, self.config)
+            save_palettes(self.palettes, self.active_palette, self.uses, self.config)
             self._refresh_cards()
             self.notify(f"Saved '{new_name}'", timeout=2)
 
         self.push_screen(
-            PaletteEditScreen(name, self.palettes[name]),
+            PaletteEditScreen(name, self.palettes[name], self.uses),
+            on_result,
+        )
+
+    def _duplicate_palette(self, source_name: str) -> None:
+        """Duplicate a read-only palette and open the editor."""
+        source_colors = self._get_palette_colors(source_name)
+
+        # Generate unique name
+        base_name = f"{source_name} (copy)"
+        new_name = base_name
+        n = 2
+        all_names = set(self._palette_names())
+        while new_name in all_names:
+            new_name = f"{base_name} {n}"
+            n += 1
+
+        def on_result(result):
+            if result is None:
+                return
+            final_name, new_colors = result
+            self.palettes[final_name] = new_colors
+            save_palettes(self.palettes, self.active_palette, self.uses, self.config)
+            self.selected_index = list(self._palette_names()).index(final_name)
+            self._refresh_cards()
+            self.notify(f"Duplicated '{source_name}' → '{final_name}'", timeout=3)
+
+        self.push_screen(
+            PaletteEditScreen(new_name, source_colors, self.uses, is_new=True),
             on_result,
         )
 
@@ -680,7 +1284,8 @@ class PaletteApp(App):
         base = "New Palette"
         name = base
         n = 2
-        while name in self.palettes:
+        all_names = set(self._palette_names())
+        while name in all_names:
             name = f"{base} {n}"
             n += 1
 
@@ -689,31 +1294,52 @@ class PaletteApp(App):
                 return
             new_name, new_colors = result
             self.palettes[new_name] = new_colors
-            save_palettes(self.palettes, self.active_palette, self.config)
-            self.selected_index = list(self.palettes.keys()).index(new_name)
+            save_palettes(self.palettes, self.active_palette, self.uses, self.config)
+            self.selected_index = list(self._palette_names()).index(new_name)
             self._refresh_cards()
             self.notify(f"Created '{new_name}'", timeout=2)
 
         self.push_screen(
-            PaletteEditScreen(name, default_colors, is_new=True),
+            PaletteEditScreen(name, default_colors, self.uses, is_new=True),
             on_result,
         )
 
     def action_delete(self) -> None:
-        if len(self.palettes) <= 1:
-            self.notify("Cannot delete the last palette", severity="error")
-            return
         name = self._selected_name()
         if name is None:
             return
+        if name in self.readonly:
+            self.notify(
+                "Cannot delete a built-in base16 scheme", severity="warning", timeout=3
+            )
+            return
+        if len(self.palettes) + len(self.base16_schemes) <= 1:
+            self.notify("Cannot delete the last palette", severity="error")
+            return
         del self.palettes[name]
         if self.active_palette == name:
-            self.active_palette = next(iter(self.palettes))
-        if self.selected_index >= len(self.palettes):
-            self.selected_index = max(0, len(self.palettes) - 1)
-        save_palettes(self.palettes, self.active_palette, self.config)
+            all_palettes = {}
+            all_palettes.update(self.base16_schemes)
+            all_palettes.update(self.palettes)
+            self.active_palette = next(iter(all_palettes)) if all_palettes else ""
+        if self.selected_index >= len(self._palette_names()):
+            self.selected_index = max(0, len(self._palette_names()) - 1)
+        save_palettes(self.palettes, self.active_palette, self.uses, self.config)
         self._refresh_cards()
         self.notify(f"Deleted '{name}'", timeout=2)
+
+    def action_edit_uses(self) -> None:
+        """Open the use-name editor."""
+
+        def on_result(result):
+            if result is None:
+                return
+            self.uses = result
+            save_palettes(self.palettes, self.active_palette, self.uses, self.config)
+            self._refresh_cards()
+            self.notify("Updated use-names", timeout=2)
+
+        self.push_screen(UsesEditScreen(self.uses), on_result)
 
     def action_activate(self) -> None:
         """Set selected palette as active, write colors, and run apply command."""
@@ -721,13 +1347,13 @@ class PaletteApp(App):
         if name is None:
             return
         self.active_palette = name
-        colors = self.palettes[name]
+        colors = self._get_palette_colors(name)
 
         # Write to theme file if configured
         if self.config.theme_file is not None:
-            write_theme_colors(colors, self.config)
+            write_theme_colors(colors, self.config, self.uses)
 
-        save_palettes(self.palettes, self.active_palette, self.config)
+        save_palettes(self.palettes, self.active_palette, self.uses, self.config)
         self._refresh_cards()
 
         # Run apply command if configured
@@ -753,7 +1379,7 @@ class PaletteApp(App):
 
 
 def check_palettes(config: Config) -> int:
-    palettes, active = load_palettes(config)
+    palettes, active, uses, base16 = load_palettes(config)
     print(f"\n  Palettes: {config.palettes_file}")
     if config.theme_file:
         print(
@@ -763,25 +1389,47 @@ def check_palettes(config: Config) -> int:
     if config.apply_command:
         print(f"  Apply:    {config.apply_command}")
     print(f"\n  Active: {active}\n")
-    for name, colors in palettes.items():
-        marker = " ★" if name == active else ""
-        print(f"  {name}{marker}")
-        for k, v in colors.items():
-            print(f"    {k:14s} {v}")
-        print()
+
+    # User palettes
+    if palettes:
+        print("  ── User Palettes ──\n")
+        for name, colors in palettes.items():
+            marker = " ★" if name == active else ""
+            print(f"  {name}{marker}")
+            for k in BASE16_KEYS:
+                use = uses.get(k, "")
+                v = colors.get(k, "???")
+                print(f"    {k} / {use:12s} {v}")
+            print()
+
+    # Base16 schemes
+    if base16:
+        print(f"  ── Base16 Schemes ({len(base16)}) ──\n")
+        for name, colors in base16.items():
+            marker = " ★" if name == active else ""
+            print(f"  {name}{marker}  🔒")
+            for k in BASE16_KEYS:
+                use = uses.get(k, "")
+                v = colors.get(k, "???")
+                print(f"    {k} / {use:12s} {v}")
+            print()
+
     return 0
 
 
 def apply_noninteractive(config: Config) -> int:
-    palettes, active = load_palettes(config)
-    if not palettes or not active:
+    palettes, active, uses, base16 = load_palettes(config)
+    all_palettes = {}
+    all_palettes.update(base16)
+    all_palettes.update(palettes)
+    if not all_palettes or not active:
         print("No active palette found", file=sys.stderr)
         return 1
-    colors = palettes[active]
+    colors = all_palettes.get(active, {})
     if config.theme_file is not None:
-        write_theme_colors(colors, config)
+        write_theme_colors(colors, config, uses)
         print(f"Written '{active}' colors to {config.theme_file}")
-    save_palettes(palettes, active, config)
+    save_palettes(palettes, active, uses, config)
     if config.apply_command:
         ok, msg = run_apply_command(config)
         print(f"  {msg}" if msg else "  (no output)")
@@ -803,12 +1451,25 @@ def main() -> None:
     parser.add_argument(
         "--init", action="store_true", help="Create default config file"
     )
+    parser.add_argument(
+        "--update-base16",
+        action="store_true",
+        help="Force-update base16 schemes cache and exit",
+    )
     args = parser.parse_args()
 
     if args.init:
         sys.exit(init_config(args.config))
 
     config = load_config(args.config)
+
+    if args.update_base16:
+        updated, count, err = update_base16_cache(config, force=True)
+        if err:
+            print(f"Failed: {err}", file=sys.stderr)
+            sys.exit(1)
+        print(f"{'Updated' if updated else 'Cache fresh'}: {count} base16 schemes")
+        sys.exit(0)
 
     if args.check:
         sys.exit(check_palettes(config))

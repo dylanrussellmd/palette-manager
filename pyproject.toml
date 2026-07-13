@@ -1,7 +1,7 @@
 [project]
 name = "palette-manager"
 version = "0.2.0"
-description = "TUI for managing color palettes for niri + Quickshell theming"
+description = "TUI for managing 16-color base16 palettes with configurable apply behavior"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -9,6 +9,7 @@ authors = [{ name = "Dylan Russell" }]
 dependencies = [
     "textual>=0.50.0",
     "ruamel.yaml>=0.18.0",
+    "hsluv>=5.0.0",
 ]
 
 [project.scripts]
