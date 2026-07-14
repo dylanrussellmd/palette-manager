@@ -1,0 +1,74 @@
+name: Check upstream sync
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # every Monday 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check ported files against upstream bamboo.nvim
+        run: |
+          set -euo pipefail
+
+          UPSTREAM="https://raw.githubusercontent.com/ribru17/bamboo.nvim/master/lua/bamboo"
+          PLUGIN="editors/nvim/lua/palette-manager"
+
+          # Files ported from bamboo.nvim with require-path renames
+          FILES=(highlights.lua util.lua terminal.lua)
+
+          # Transformation: bamboo → palette-manager
+          transform() {
+            sed \
+              -e "s|require('bamboo.colors')|require('palette-manager.colors')|g" \
+              -e "s|require('bamboo.util')|require('palette-manager.util')|g" \
+              -e "s|require('bamboo.highlights')|require('palette-manager.highlights')|g" \
+              -e "s|vim.g.bamboo_config|vim.g.palette_manager_config|g" \
+              -e "s|bamboo.nvim|palette-manager|g"
+          }
+
+          # Strip header comments (block --[[ ]] and line --)
+          # so only functional code is compared
+          strip_header() {
+            awk '
+              /^[[:space:]]*--\[\[/ { in_block=1; next }
+              in_block && /\]\]/ { in_block=0; next }
+              in_block { next }
+              /^[[:space:]]*--/ { next }
+              /^[[:space:]]*$/ { next }
+              { p=1 }
+              p
+            '
+          }
+
+          EXIT_CODE=0
+
+          for f in "${FILES[@]}"; do
+            # Download upstream, transform, strip header
+            curl -sSL "$UPSTREAM/$f" | transform | strip_header > /tmp/upstream.lua
+
+            # Strip header from our version
+            strip_header < "$PLUGIN/$f" > /tmp/ours.lua
+
+            if diff -q /tmp/upstream.lua /tmp/ours.lua > /dev/null 2>&1; then
+              echo "✓ $f: up to date"
+            else
+              echo "✗ $f: out of date"
+              echo "  Diff (upstream → ours):"
+              diff -u /tmp/upstream.lua /tmp/ours.lua | head -40 | sed 's/^/    /'
+              EXIT_CODE=1
+            fi
+          done
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo ""
+            echo "::error::Ported files are out of sync with upstream bamboo.nvim."
+            echo "::error::Re-port the changed files from https://github.com/ribru17/bamboo.nvim"
+            echo "::error::Apply: sed -e \"s|require('bamboo.X)|require('palette-manager.X)|g\" -e \"s|vim.g.bamboo_config|vim.g.palette_manager_config|g\" -e \"s|bamboo.nvim|palette-manager|g\""
+          fi
+
+          exit $EXIT_CODE

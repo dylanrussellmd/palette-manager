@@ -20,8 +20,9 @@ Configure theme file output and apply commands via a config file:
 Config file format (YAML):
 
     palettes_file: ~/.config/palette-manager/palettes.yaml
-    theme_file: null               # where to write active palette's colors
-    theme_path: null               # dotted path within the file (e.g. "theme.colors")
+    yaml_file: null                # where to write active palette's colors (YAML)
+    yaml_path: null                # dotted path within the file (e.g. "theme.colors")
+    lua_file: null                 # where to write active palette's colors (Lua)
     apply_command: null            # shell command to run after writing
 
 Usage:
@@ -278,8 +279,9 @@ class Config:
     """Runtime configuration loaded from config.yaml."""
 
     palettes_file: Path = DEFAULT_PALETTES_FILE
-    theme_file: Path | None = None
-    theme_path: str | None = None
+    yaml_file: Path | None = None
+    yaml_path: str | None = None
+    lua_file: Path | None = None
     apply_command: str | None = None
 
     @property
@@ -308,8 +310,9 @@ def load_config(config_path: Path | None = None) -> Config:
 
     return Config(
         palettes_file=resolve(data.get("palettes_file")) or DEFAULT_PALETTES_FILE,
-        theme_file=resolve(data.get("theme_file")),
-        theme_path=data.get("theme_path"),
+        yaml_file=resolve(data.get("yaml_file")),
+        yaml_path=data.get("yaml_path"),
+        lua_file=resolve(data.get("lua_file")),
         apply_command=data.get("apply_command"),
     )
 
@@ -330,18 +333,24 @@ def init_config(config_path: Path | None = None) -> int:
 # Where to store palettes (created automatically if missing)
 palettes_file: ~/.config/palette-manager/palettes.yaml
 
-# Where to write the active palette's colors on apply.
+# Where to write the active palette's colors on apply (YAML format).
 # Set to null to skip writing (palettes are still saved).
-theme_file: null
+yaml_file: null
 
-# Dotted path within the theme file to write colors under.
+# Dotted path within the YAML file to write colors under.
 # e.g. "theme.colors" writes to doc["theme"]["colors"]
 # Leave null to write at the root level.
-theme_path: null
+yaml_path: null
 
 # palette-manager writes all 16 base16 keys (base00–base0F) plus
 # their use-name aliases (bg, surface, text, etc.) from the `uses`
 # mapping in palettes.yaml. No need to list keys here.
+
+# Optional: also write colors as a Lua table for Lua-based consumers
+# (e.g. the palette-manager Neovim plugin). The output file returns a
+# plain table with base16 names and use-name aliases.
+# Set to null to skip.
+lua_file: null
 
 # Shell command to run after writing colors on apply.
 # Examples:
@@ -352,7 +361,7 @@ apply_command: null
 """
     path.write_text(default_config)
     print(f"Created config: {path}")
-    print("Edit it to configure theme_file and apply_command for your setup.")
+    print("Edit it to configure yaml_file, lua_file, and apply_command for your setup.")
     return 0
 
 
@@ -587,22 +596,22 @@ def save_palettes(palettes: dict, active: str, uses: dict, config: Config) -> No
     _dump_yaml(config.palettes_file, data)
 
 
-def write_theme_colors(colors: dict, config: Config, uses: dict) -> None:
-    """Write active palette's colors into theme file as both base16 names and use-name aliases."""
-    if config.theme_file is None:
+def write_yaml_colors(colors: dict, config: Config, uses: dict) -> None:
+    """Write active palette's colors into YAML file as both base16 names and use-name aliases."""
+    if config.yaml_file is None:
         return
 
     yaml = YAML()
-    if config.theme_file.exists():
-        with open(config.theme_file) as f:
+    if config.yaml_file.exists():
+        with open(config.yaml_file) as f:
             doc = yaml.load(f)
     else:
         doc = {}
 
     # Navigate to the target path
     target = doc
-    if config.theme_path:
-        for part in config.theme_path.split("."):
+    if config.yaml_path:
+        for part in config.yaml_path.split("."):
             if part not in target or target[part] is None:
                 target[part] = {}
             target = target[part]
@@ -616,9 +625,38 @@ def write_theme_colors(colors: dict, config: Config, uses: dict) -> None:
         if base16_key in colors:
             target[use_name] = colors[base16_key]
 
-    config.theme_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(config.theme_file, "w") as f:
+    config.yaml_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(config.yaml_file, "w") as f:
         yaml.dump(doc, f)
+
+
+def write_lua_colors(colors: dict, config: Config, uses: dict) -> None:
+    """Write active palette's colors as a Lua table to config.lua_file.
+
+    Output is a plain Lua file returning a table with both base16 names
+    (base00–base0F) and use-name aliases (bg, surface, text, etc.).
+    Readable via loadfile() in any Lua environment — Neovim plugins,
+    standalone Lua scripts, etc.
+    """
+    if config.lua_file is None:
+        return
+
+    lines = ["return {"]
+
+    # base16 keys
+    for key in BASE16_KEYS:
+        val = colors.get(key, "#000000")
+        lines.append(f"  {key} = '{val}',")
+
+    # use-name aliases
+    for base16_key, use_name in uses.items():
+        if base16_key in colors:
+            lines.append(f"  {use_name} = '{colors[base16_key]}',")
+
+    lines.append("}")
+
+    config.lua_file.parent.mkdir(parents=True, exist_ok=True)
+    config.lua_file.write_text("\n".join(lines) + "\n")
 
 
 def _dump_yaml(path: Path, data: dict) -> None:
@@ -1800,8 +1838,10 @@ class PaletteApp(App):
             return
         self.active_palette = name
         colors = self._get_palette_colors(name)
-        if self.config.theme_file is not None:
-            write_theme_colors(colors, self.config, self.uses)
+        if self.config.yaml_file is not None:
+            write_yaml_colors(colors, self.config, self.uses)
+        if self.config.lua_file is not None:
+            write_lua_colors(colors, self.config, self.uses)
         save_palettes(self.palettes, self.active_palette, self.uses, self.config)
         self._render_list()
         if self.config.apply_command:
@@ -1823,11 +1863,13 @@ class PaletteApp(App):
 def check_palettes(config: Config) -> int:
     palettes, active, uses, base16 = load_palettes(config)
     print(f"\n  Palettes: {config.palettes_file}")
-    if config.theme_file:
+    if config.yaml_file:
         print(
-            f"  Theme:    {config.theme_file}"
-            + (f" ({config.theme_path})" if config.theme_path else "")
+            f"  YAML:     {config.yaml_file}"
+            + (f" ({config.yaml_path})" if config.yaml_path else "")
         )
+    if config.lua_file:
+        print(f"  Lua:      {config.lua_file}")
     if config.apply_command:
         print(f"  Apply:    {config.apply_command}")
     print(f"\n  Active: {active}\n")
@@ -1868,9 +1910,12 @@ def apply_noninteractive(config: Config) -> int:
         print("No active palette found", file=sys.stderr)
         return 1
     colors = all_palettes.get(active, {})
-    if config.theme_file is not None:
-        write_theme_colors(colors, config, uses)
-        print(f"Written '{active}' colors to {config.theme_file}")
+    if config.yaml_file is not None:
+        write_yaml_colors(colors, config, uses)
+        print(f"Written '{active}' colors to {config.yaml_file}")
+    if config.lua_file is not None:
+        write_lua_colors(colors, config, uses)
+        print(f"Written '{active}' colors to {config.lua_file}")
     save_palettes(palettes, active, uses, config)
     if config.apply_command:
         ok, msg = run_apply_command(config)

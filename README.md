@@ -17,8 +17,9 @@ A terminal UI for managing 16-color palettes using the [base16](https://github.c
                                    │
                              active palette
                                    │
-                         writes 32 color keys to
-                         theme_file (base16 + use-names)
+                          writes 32 color keys to
+                          yaml_file / lua_file
+                          (base16 + use-names)
                                    │
                          runs apply_command
                          (e.g. chezmoi apply, hyprctl reload)
@@ -91,30 +92,36 @@ Edit `~/.config/palette-manager/config.yaml`:
 # Where to store palettes (created automatically if missing)
 palettes_file: ~/.config/palette-manager/palettes.yaml
 
-# Where to write the active palette's colors on apply.
+# Where to write the active palette's colors on apply (YAML format).
 # Set to null to skip writing.
-theme_file: null
+yaml_file: null
 
-# Dotted path within the theme file to write colors under.
+# Dotted path within the YAML file to write colors under.
 # e.g. "theme.colors" writes to doc["theme"]["colors"]
 # Leave null to write at the root level.
-theme_path: null
+yaml_path: null
 
 # palette-manager writes all 16 base16 keys (base00–base0F) plus
 # their use-name aliases (bg, surface, text, etc.) from the `uses`
 # mapping in palettes.yaml. No need to list keys here.
+
+# Optional: also write colors as a Lua table for Lua-based consumers
+# (e.g. the palette-manager Neovim plugin). The output file returns a
+# plain table with base16 names and use-name aliases.
+# Set to null to skip.
+lua_file: null
 
 # Shell command to run after writing colors on apply.
 # Set to null to skip.
 apply_command: null
 ```
 
-### Example: chezmoi + niri + Quickshell + kitty + starship
+### Example: chezmoi (templated configs)
 
 ```yaml
 palettes_file: ~/.local/share/chezmoi/.chezmoidata/palettes.yaml
-theme_file: ~/.local/share/chezmoi/.chezmoidata/theme.yaml
-theme_path: theme.colors
+yaml_file: ~/.local/share/chezmoi/.chezmoidata/theme.yaml
+yaml_path: theme.colors
 apply_command: chezmoi apply
 ```
 
@@ -124,8 +131,8 @@ With this setup, `palette-manager` writes colors to `theme.yaml`, then `chezmoi 
 
 ```yaml
 palettes_file: ~/.config/palette-manager/palettes.yaml
-theme_file: ~/.config/hypr/colors.conf
-theme_path: null
+yaml_file: ~/.config/hypr/colors.conf
+yaml_path: null
 apply_command: hyprctl reload
 ```
 
@@ -133,8 +140,8 @@ apply_command: hyprctl reload
 
 ```yaml
 palettes_file: ~/.config/palette-manager/palettes.yaml
-theme_file: ~/.config/palette-manager/colors.yaml
-theme_path: null
+yaml_file: ~/.config/palette-manager/colors.yaml
+yaml_path: null
 apply_command: ~/.config/palette-manager/apply.sh
 ```
 
@@ -142,10 +149,22 @@ apply_command: ~/.config/palette-manager/apply.sh
 
 ```yaml
 palettes_file: ~/.config/palette-manager/palettes.yaml
-theme_file: null
-theme_path: null
+yaml_file: null
+yaml_path: null
+lua_file: null
 apply_command: null
 ```
+
+### Example: Neovim plugin
+
+```yaml
+palettes_file: ~/.config/palette-manager/palettes.yaml
+yaml_file: null
+lua_file: ~/.config/palette-manager/theme.lua
+apply_command: null
+```
+
+With this setup, `palette-manager` writes colors directly to `theme.lua` as a Lua table. The [palette-manager.nvim](editors/nvim/) plugin reads this file and applies the colorscheme, with live-reload on changes. No template engine or external apply step needed.
 
 ## Usage
 
