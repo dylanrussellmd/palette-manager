@@ -75,6 +75,51 @@ Templates reference whichever name is more readable:
 uv tool install git+https://github.com/dylanrussellmd/palette-manager
 ```
 
+## Neovim plugin
+
+The Neovim colorscheme plugin lives in [`editors/nvim/`](editors/nvim/) inside this repo — this is a monorepo that also contains the Python CLI tool. Because lazy.nvim clones the repo root and adds it to the runtimepath, the plugin's `lua/` and `colors/` directories (nested under `editors/nvim/`) aren't found by default. A `build` step symlinks them to the repo root after clone so `require('palette-manager')` resolves.
+
+### lazy.nvim
+
+```lua
+-- lua/plugins/palette-manager.lua
+return {
+  'dylanrussellmd/palette-manager',
+  lazy = false,
+  priority = 1000,
+  build = 'ln -sfn editors/nvim/lua lua && ln -sfn editors/nvim/colors colors',
+  config = function()
+    require('palette-manager').setup {
+      transparent = true,
+      dim_inactive = true,
+      term_colors = true,
+      code_style = {
+        comments = { italic = true },
+        conditionals = { italic = true },
+        keywords = {},
+        functions = {},
+        namespaces = { italic = true },
+        parameters = { italic = true },
+        strings = {},
+        variables = {},
+      },
+      lualine = {
+        transparent = false,
+      },
+      diagnostics = {
+        darker = false,
+        undercurl = true,
+        background = true,
+      },
+    }
+  end,
+}
+```
+
+> **Why the `build` step?** The repo is a monorepo — the Python CLI lives at the root and the Neovim plugin lives under `editors/nvim/`. lazy.nvim adds the cloned repo root to `runtimepath`, but `require('palette-manager')` looks for `lua/palette-manager/init.lua` at that root. The symlinks make `editors/nvim/lua/` → `lua/` and `editors/nvim/colors/` → `colors/` so Neovim finds the module and colorscheme where it expects them.
+
+The plugin reads colors from a Lua theme file (default: `~/.config/palette-manager/theme.lua`). To have the CLI generate this file, set `lua_file` in your palette-manager config — see [Example: Neovim plugin](#example-neovim-plugin) below.
+
 ## Quick start
 
 ```bash
