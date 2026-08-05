@@ -91,7 +91,17 @@ from textual.message import Message
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widget import Widget
-from textual.widgets import Button, Footer, Header, Input, Label, Static
+from textual.widgets import (
+    Button,
+    Footer,
+    Header,
+    Input,
+    Label,
+    LoadingIndicator,
+    Log,
+    Static,
+)
+from textual.worker import WorkerCancelled, get_current_worker
 
 # ── Constants ────────────────────────────────────────────────────
 
@@ -676,6 +686,7 @@ def run_apply_command(config: Config) -> tuple[bool, str]:
             config.apply_command,
             shell=True,
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
             timeout=120,
         )
@@ -1277,6 +1288,139 @@ def palette_matches(query: str, name: str, colors: dict) -> bool:
 # ── Main app ─────────────────────────────────────────────────────
 
 
+class ApplyProgressScreen(ModalScreen[None]):
+    """Modal log that streams step names while activate runs in a worker thread."""
+
+    DEFAULT_CSS = """
+    ApplyProgressScreen {
+        align: center middle;
+    }
+    ApplyProgressScreen > #apply-dialog {
+        width: 80;
+        max-width: 92%;
+        height: 24;
+        border: round $primary;
+        padding: 1 2;
+        background: $surface;
+    }
+    ApplyProgressScreen #apply-header {
+        height: 1;
+        padding: 0 0 1 0;
+    }
+    ApplyProgressScreen #apply-spinner {
+        width: 3;
+        height: 1;
+        padding: 0 1 0 0;
+    }
+    ApplyProgressScreen #apply-title {
+        text-style: bold;
+        width: 1fr;
+        content-align: left middle;
+    }
+    ApplyProgressScreen #apply-log {
+        height: 1fr;
+        border: round $primary-darken-2;
+        padding: 0 1;
+    }
+    ApplyProgressScreen #apply-buttons {
+        height: 3;
+        align-horizontal: right;
+        padding: 1 0 0 0;
+    }
+    ApplyProgressScreen Button {
+        margin-left: 1;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel_dismiss", "Cancel", show=False)]
+
+    def __init__(self, palette_name: str) -> None:
+        super().__init__()
+        self.palette_name = palette_name
+        self._cancelled_by_user = False
+        self._finished = False
+        self._pending_steps: list[str] = []
+
+    def compose(self) -> ComposeResult:
+        with Container(id="apply-dialog"):
+            with Horizontal(id="apply-header"):
+                yield LoadingIndicator(id="apply-spinner")
+                yield Static(f"Applying '{self.palette_name}'…", id="apply-title")
+            yield Log(id="apply-log", highlight=True, auto_scroll=True)
+            with Horizontal(id="apply-buttons"):
+                yield Button("Cancel", id="apply-cancel", variant="warning")
+                yield Button("Close", id="apply-close", variant="primary")
+
+    def on_mount(self) -> None:
+        self._log = self.query_one("#apply-log", Log)
+        self.query_one("#apply-close", Button).display = False
+        # Drain any step lines that arrived before the log widget was mounted.
+        pending, self._pending_steps = self._pending_steps, []
+        for text in pending:
+            self._log.write_line(text)
+
+    # ── Thread-safe callbacks invoked via App.call_from_thread ───
+    # These run on the main loop, so they touch widgets directly.
+    # Lines that arrive before on_mount are buffered and drained there.
+
+    def write_step(self, text: str) -> None:
+        if self._finished:
+            return
+        log = getattr(self, "_log", None)
+        if log is None:
+            self._pending_steps.append(text)
+            return
+        try:
+            log.write_line(text)
+        except Exception:
+            pass
+
+    def write_finished(self, ok: bool, summary: str) -> None:
+        if not self.is_mounted or self._finished:
+            return
+        self._finished = True
+        self.query_one("#apply-spinner", LoadingIndicator).display = False
+        title = self.query_one("#apply-title", Static)
+        if self._cancelled_by_user:
+            title.update(f"Cancelled '{self.palette_name}'")
+        elif summary:
+            title.update(summary)
+        else:
+            title.update(f"Saved '{self.palette_name}'")
+        self.query_one("#apply-cancel", Button).display = False
+        close = self.query_one("#apply-close", Button)
+        close.display = True
+        close.focus()
+
+    # ── User dismiss / cancel ──────────────────────────────────────
+
+    def action_cancel_dismiss(self) -> None:
+        self._user_cancel()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply-cancel":
+            self._user_cancel()
+        elif event.button.id == "apply-close":
+            self.dismiss()
+
+    def _user_cancel(self) -> None:
+        """User pressed Cancel/Escape — cancel the in-flight worker (best-effort)
+        and dismiss the screen. The worker thread may still be running (e.g.,
+        blocked inside a long subprocess); a toast notification will report
+        when it actually finishes.
+        """
+        if self._finished:
+            # Worker is already done; just close.
+            self.dismiss()
+            return
+        self._cancelled_by_user = True
+        # Tell any running worker to bail out at its next step.
+        for w in list(self.app.workers):
+            if w.name == "activate":
+                w.cancel()
+        self.dismiss()
+
+
 class PaletteApp(App):
     """Palette manager with configurable apply behavior."""
 
@@ -1343,6 +1487,7 @@ class PaletteApp(App):
         self.SUB_TITLE = str(config.palettes_file)
         self._filter_cache: tuple[str, list[tuple[str, dict]]] | None = None
         self._search_counter = 0
+        self.progress_screen: ApplyProgressScreen | None = None
 
     def on_resize(self, event) -> None:
         """Re-render list when terminal is resized."""
@@ -1838,23 +1983,73 @@ class PaletteApp(App):
             return
         self.active_palette = name
         colors = self._get_palette_colors(name)
-        if self.config.yaml_file is not None:
-            write_yaml_colors(colors, self.config, self.uses)
-        if self.config.lua_file is not None:
-            write_lua_colors(colors, self.config, self.uses)
-        save_palettes(self.palettes, self.active_palette, self.uses, self.config)
-        self._render_list()
-        if self.config.apply_command:
-            self.notify(
-                f"Applied '{name}' — running {self.config.apply_command}...", timeout=3
-            )
-            ok, msg = run_apply_command(self.config)
-            if ok and msg:
-                self.notify(msg, timeout=3)
-            elif not ok:
-                self.notify(msg, timeout=5, severity="error")
-        else:
-            self.notify(f"Saved '{name}' as active", timeout=2)
+        cfg = self.config
+
+        # Show the progress screen first, then do the work in a worker thread
+        # so the UI stays responsive (chezmoi apply can be slow).
+        self.progress_screen = ApplyProgressScreen(palette_name=name)
+        self.push_screen(self.progress_screen)
+        self.run_worker(
+            lambda: self._activate_worker(colors, name, cfg),
+            thread=True,
+            exclusive=True,
+            name="activate",
+            exit_on_error=False,
+        )
+
+    def _activate_worker(self, colors: dict, name: str, cfg: Config) -> None:
+        """Runs on a worker thread. Reports each step to the progress screen."""
+        worker = get_current_worker()
+        screen = self.progress_screen
+
+        def step(msg: str) -> None:
+            if worker.is_cancelled:
+                raise WorkerCancelled()
+            if screen is not None:
+                # call_from_thread ensures the write happens on the main loop.
+                self.call_from_thread(screen.write_step, msg)
+
+        ok = False
+        summary = ""
+        try:
+            if cfg.yaml_file is not None:
+                step(f"  → writing {cfg.yaml_file}")
+                write_yaml_colors(colors, cfg, self.uses)
+            if cfg.lua_file is not None:
+                step(f"  → writing {cfg.lua_file}")
+                write_lua_colors(colors, cfg, self.uses)
+            step("  → saving palettes file")
+            save_palettes(self.palettes, self.active_palette, self.uses, cfg)
+            self.call_from_thread(self._render_list)
+
+            if cfg.apply_command:
+                step(f"  → running: {cfg.apply_command}")
+                ok, msg = run_apply_command(cfg)
+                step(f"  ✓ {msg}" if ok else f"  ✗ {msg}")
+                summary = f"Applied '{name}' — {msg}" if ok else f"Failed: {msg}"
+            else:
+                ok = True
+                summary = f"Saved '{name}' as active"
+                step("  ✓ done (no apply_command configured)")
+        except WorkerCancelled:
+            ok = False
+            summary = f"Cancelled '{name}'"
+        except Exception as exc:
+            ok = False
+            summary = f"Error: {exc}"
+            if screen is not None:
+                self.call_from_thread(
+                    screen.write_step, f"  ✗ {type(exc).__name__}: {exc}"
+                )
+        finally:
+            # Switch the screen from spinner+Cancel to static result+Close.
+            if screen is not None:
+                self.call_from_thread(screen.write_finished, ok, summary)
+            # Toast the user about the outcome.
+            if ok:
+                self.call_from_thread(self.notify, summary, timeout=3)
+            else:
+                self.call_from_thread(self.notify, summary, timeout=5, severity="error")
 
 
 # ── CLI entry points ─────────────────────────────────────────────
