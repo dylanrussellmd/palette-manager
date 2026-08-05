@@ -71,9 +71,13 @@ from __future__ import annotations
 import argparse
 import io
 import math
+import os
+import signal
 import subprocess
 import sys
 import tarfile
+import threading
+import time
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -676,27 +680,82 @@ def _dump_yaml(path: Path, data: dict) -> None:
         yaml.dump(data, f)
 
 
-def run_apply_command(config: Config) -> tuple[bool, str]:
-    """Run the configured apply command. Returns (success, message)."""
+def run_apply_command(
+    config: Config,
+    cancel_event: threading.Event | None = None,
+    timeout: float = 120.0,
+) -> tuple[bool, str]:
+    """Run the configured apply command. Returns (success, message).
+
+    If ``cancel_event`` is set while the command is running, the entire
+    process group is killed (SIGTERM, then SIGKILL after 2s) and the call
+    returns ``(False, "cancelled")``. This is the only way to actually
+    interrupt a blocking subprocess from a worker thread — ``subprocess.run``
+    is uncancellable from the outside.
+    """
     if config.apply_command is None:
         return True, ""
 
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             config.apply_command,
             shell=True,
-            capture_output=True,
-            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=120,
+            start_new_session=True,  # new process group → killpg works
+            # No controlling tty → sudo can't open /dev/tty, so a sudo
+            # password prompt can't hijack the TUI terminal.
         )
-        if result.returncode == 0:
-            return True, f"{config.apply_command} complete"
-        return False, f"{config.apply_command} failed: {result.stderr[:200]}"
     except FileNotFoundError:
         return False, f"command not found: {config.apply_command}"
+
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            if proc.poll() is not None:
+                break
+            if cancel_event is not None and cancel_event.is_set():
+                _kill_process_group(proc)
+                return False, f"{config.apply_command} cancelled"
+            if time.monotonic() > deadline:
+                _kill_process_group(proc)
+                return False, f"{config.apply_command} timed out"
+            time.sleep(0.05)
+    except BaseException:
+        # Any unexpected error: best-effort kill, then re-raise.
+        _kill_process_group(proc)
+        raise
+
+    stdout, stderr = proc.communicate()
+    if proc.returncode == 0:
+        return True, f"{config.apply_command} complete"
+    if proc.returncode < 0:
+        return False, f"{config.apply_command} killed (signal {-proc.returncode})"
+    return False, f"{config.apply_command} failed: {(stderr or stdout).strip()[:200]}"
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """SIGTERM the process group, then SIGKILL after 2s if still alive."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    try:
+        proc.wait(timeout=2)
     except subprocess.TimeoutExpired:
-        return False, f"{config.apply_command} timed out"
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 # ── Color swatch widget ──────────────────────────────────────────
@@ -1323,9 +1382,10 @@ class ApplyProgressScreen(ModalScreen[None]):
         padding: 0 1;
     }
     ApplyProgressScreen #apply-buttons {
-        height: 3;
+        height: auto;
         align-horizontal: right;
-        padding: 1 0 0 0;
+        align-vertical: middle;
+        margin-top: 1;
     }
     ApplyProgressScreen Button {
         margin-left: 1;
@@ -1404,17 +1464,23 @@ class ApplyProgressScreen(ModalScreen[None]):
             self.dismiss()
 
     def _user_cancel(self) -> None:
-        """User pressed Cancel/Escape — cancel the in-flight worker (best-effort)
-        and dismiss the screen. The worker thread may still be running (e.g.,
-        blocked inside a long subprocess); a toast notification will report
-        when it actually finishes.
+        """User pressed Cancel/Escape.
+
+        Signals the worker to kill its apply subprocess (if any) via a
+        threading.Event. The worker polls the event and calls os.killpg
+        to actually terminate the process group. The screen dismisses
+        immediately; the worker thread finishes on its own and posts a
+        "cancelled" notification via the finally block.
         """
         if self._finished:
             # Worker is already done; just close.
             self.dismiss()
             return
         self._cancelled_by_user = True
-        # Tell any running worker to bail out at its next step.
+        # Signal the worker's subprocess poll loop.
+        if self.app._apply_cancel_event is not None:
+            self.app._apply_cancel_event.set()
+        # Also flag the worker itself for the between-steps check.
         for w in list(self.app.workers):
             if w.name == "activate":
                 w.cancel()
@@ -1488,6 +1554,7 @@ class PaletteApp(App):
         self._filter_cache: tuple[str, list[tuple[str, dict]]] | None = None
         self._search_counter = 0
         self.progress_screen: ApplyProgressScreen | None = None
+        self._apply_cancel_event: threading.Event | None = None
 
     def on_resize(self, event) -> None:
         """Re-render list when terminal is resized."""
@@ -2001,9 +2068,14 @@ class PaletteApp(App):
         """Runs on a worker thread. Reports each step to the progress screen."""
         worker = get_current_worker()
         screen = self.progress_screen
+        # Event set by the screen's Cancel button so the apply subprocess
+        # can be killed mid-run. This is the only way to interrupt a
+        # blocking subprocess from a worker thread.
+        cancel_event = threading.Event()
+        self._apply_cancel_event = cancel_event
 
         def step(msg: str) -> None:
-            if worker.is_cancelled:
+            if worker.is_cancelled or cancel_event.is_set():
                 raise WorkerCancelled()
             if screen is not None:
                 # call_from_thread ensures the write happens on the main loop.
@@ -2024,7 +2096,7 @@ class PaletteApp(App):
 
             if cfg.apply_command:
                 step(f"  → running: {cfg.apply_command}")
-                ok, msg = run_apply_command(cfg)
+                ok, msg = run_apply_command(cfg, cancel_event=cancel_event)
                 step(f"  ✓ {msg}" if ok else f"  ✗ {msg}")
                 summary = f"Applied '{name}' — {msg}" if ok else f"Failed: {msg}"
             else:
