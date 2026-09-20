@@ -172,6 +172,47 @@ apply_command: chezmoi apply
 
 With this setup, `palette-manager` writes colors to `theme.yaml`, then `chezmoi apply` renders all template files that reference `{{ .theme.colors.* }}` — window manager config, terminal config, shell prompt, panel widgets, etc.
 
+### OpenCode V2 (2.0.8)
+
+OpenCode integration uses the same chezmoi pipeline above: palette-manager
+exports colors, and your external theme template renders the OpenCode theme.
+The Python package does not generate OpenCode JSON or update client settings.
+
+For OpenCode **2.0.8**, render the native theme format against the
+[pinned theme schema](https://github.com/anomalyco/opencode/blob/7673ed6bd6547ee0dcb81aab55f1392fb751d652/packages/theme/src/tui/schema.ts):
+
+- Use `version: 2`, with tokens inside `dark` and/or `light`.
+- Hue scales belong in `dark.hue` (or `light.hue`), with steps `100`–`900`.
+- The foreground tokens are `text.default` and `text.subdued`.
+- Context overrides use `@context:elevated` and `@context:overlay`.
+- Use `standalone: true` with a complete token tree when every color should
+  come from the palette rather than built-in theme defaults.
+
+The newer rolling documentation's `base` / `text.base` format does not match
+2.0.8. Preserve the palette's semantic mappings when updating the template:
+`bg` → background, `text` → foreground, `muted` → subdued text, `blue` →
+interactive controls, and `accent` → active highlights. Templates using the
+example configuration above access these colors as `{{ .theme.colors.bg }}`,
+etc.; adapt that prefix to your configured `yaml_path`.
+
+Select the rendered theme by updating **only `theme.name`** in the existing
+global `$XDG_CONFIG_HOME/opencode/cli.json` (default:
+`~/.config/opencode/cli.json`). For a theme named `palette-manager`, the relevant
+fragment is:
+
+```json
+{
+  "theme": {
+    "name": "palette-manager"
+  }
+}
+```
+
+Merge this into the existing object, preserving `theme.mode` and all other
+client preferences. OpenCode V2 uses `cli.json`, replacing V1's `tui.json`;
+external apply scripts that select a theme should target the new file and
+nested key too.
+
 ### Example: Hyprland
 
 ```yaml
